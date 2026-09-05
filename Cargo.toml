@@ -1,0 +1,29 @@
+[package]
+name = "moon_lsp"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A language server client: the process, the framing, the position arithmetic, and a registry of servers per workspace"
+authors = ["Antoine M-P"]
+license = "MIT"
+repository = "https://github.com/antoineMoPa/moon_lsp"
+documentation = "https://docs.rs/moon_lsp"
+readme = "README.md"
+keywords = ["lsp", "language-server", "editor", "jsonrpc"]
+categories = ["development-tools"]
+exclude = [".github/"]
+
+# Published on its own: the crate is a language server client, not part of whatever editor
+# vendors it.
+[workspace]
+
+[dependencies]
+anyhow = "1"
+# The wire types - initialize replies, definition answers, completion lists. Only the shapes;
+# the transport and the process are this crate's own.
+lsp-types = "0.97"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints.rust]
+missing_docs = "warn"
