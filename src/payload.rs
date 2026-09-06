@@ -43,6 +43,74 @@ pub struct LspCompletion {
     pub detail: Option<String>,
     /// What the server means to be typed, which is the label where it did not say.
     pub insert: String,
+    /// What sort of thing it is, where the server said. `None` is a server that did not say,
+    /// which is a thing of no known sort rather than a thing of some default sort - a caller
+    /// acting on the kind has to be able to tell those apart.
+    pub kind: Option<LspCompletionKind>,
+}
+
+/// What sort of thing a server offered: a function, a field, a keyword.
+///
+/// The protocol's own list, written out here rather than passed on as
+/// [`lsp_types::CompletionItemKind`], because that type is this crate's business and the
+/// answer crosses out of it - to a widget that never heard of the protocol, and over a wire
+/// as JSON. Nothing here reads anything into a kind: what a caller does about a function is a
+/// caller's decision, and this crate only carries which one it was told.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspCompletionKind {
+    /// Plain text with no meaning behind it.
+    Text,
+    /// A method on something.
+    Method,
+    /// A free function.
+    Function,
+    /// A constructor, however the language spells one.
+    Constructor,
+    /// A field of a struct, a record, an object.
+    Field,
+    /// A local, a parameter, a global.
+    Variable,
+    /// A class.
+    Class,
+    /// An interface, a trait, a protocol.
+    Interface,
+    /// A module, a namespace, a package.
+    Module,
+    /// A property, where a language has those apart from fields.
+    Property,
+    /// A unit - a measure a language has literals for.
+    Unit,
+    /// A value, where the server means the value rather than the name of one.
+    Value,
+    /// An enum.
+    Enum,
+    /// A keyword of the language.
+    Keyword,
+    /// A snippet the server means to be expanded. Never asked for here - see
+    /// [`crate::protocol::initialize_params`], which says this client does not do snippets -
+    /// but a server is free to send one anyway.
+    Snippet,
+    /// A colour.
+    Color,
+    /// A file.
+    File,
+    /// A reference.
+    Reference,
+    /// A folder.
+    Folder,
+    /// One member of an enum.
+    EnumMember,
+    /// A constant.
+    Constant,
+    /// A struct.
+    Struct,
+    /// An event.
+    Event,
+    /// An operator.
+    Operator,
+    /// A type parameter - a generic's `T`.
+    TypeParameter,
 }
 
 /// Whether there is a language server behind a file, and whether it can answer yet.

@@ -17,7 +17,7 @@ use crate::{
     languages::{self, ExtensionSpec, ServerSpec},
     payload::{LspCompletion, LspLocation, LspPosition, LspStatus, LspWork},
     process::{LanguageServer, PositionEncoding},
-    protocol,
+    protocol::{self, ClientIdentity},
 };
 
 /// The repo a question is about: where its files are, and what its servers are held under.
@@ -45,6 +45,11 @@ pub struct LspRegistry {
     /// installs their servers is the host application's business - see
     /// [`languages::installed_at`].
     search_path: String,
+    /// Who every server started here is told it is talking to. The caller's for the same
+    /// reason the search path is: a library has no host application's name to give, so
+    /// unless one is said with [`LspRegistry::identifying_as`] this is the crate itself -
+    /// see [`ClientIdentity`].
+    client: ClientIdentity,
     servers: Mutex<HashMap<ServerKey, Arc<LanguageServer>>>,
     /// The servers that are on PATH and would not start, which is not the same as not being
     /// installed at all: a `rust-analyzer` on PATH that is really a rustup shim for a
@@ -56,12 +61,36 @@ pub struct LspRegistry {
 
 impl LspRegistry {
     /// A registry that looks for its servers on `search_path`, which is a `PATH`.
+    ///
+    /// Every server it starts is told it is talking to `moon_lsp`, of this crate's version,
+    /// until a caller says otherwise with [`LspRegistry::identifying_as`].
     pub fn new(search_path: String) -> Self {
         Self {
             search_path,
+            client: ClientIdentity::default(),
             servers: Mutex::new(HashMap::new()),
             would_not_start: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// Say who the host application is, so that is what its servers are told rather than the
+    /// name of the library they are being spoken to through.
+    ///
+    /// Worth saying: a server writes `clientInfo` into its log, which is where a report about
+    /// one of these servers is eventually read, and a few of them offer different things to
+    /// different editors. It is a separate call rather than an argument to
+    /// [`LspRegistry::new`] because a caller that has nothing to say about itself is already
+    /// answered truthfully - see [`ClientIdentity`].
+    ///
+    /// ```
+    /// use moon_lsp::{ClientIdentity, LspRegistry};
+    ///
+    /// let servers = LspRegistry::new(std::env::var("PATH").unwrap_or_default())
+    ///     .identifying_as(ClientIdentity::new("my-editor", env!("CARGO_PKG_VERSION")));
+    /// ```
+    pub fn identifying_as(mut self, client: ClientIdentity) -> Self {
+        self.client = client;
+        self
     }
 
     fn running(&self, key: &ServerKey) -> Option<Arc<LanguageServer>> {
@@ -126,7 +155,12 @@ impl LspRegistry {
             return Ok(running);
         }
 
-        let started = Arc::new(LanguageServer::start(spec, repo_root, &self.search_path)?);
+        let started = Arc::new(LanguageServer::start(
+            spec,
+            repo_root,
+            &self.search_path,
+            &self.client,
+        )?);
         let mut servers = self.servers.lock().unwrap();
         Ok(Arc::clone(servers.entry(key.clone()).or_insert(started)))
     }

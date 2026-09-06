@@ -6,7 +6,7 @@
 //! buy is the framing in [`crate::framing`].
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::{Read, Write},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -17,7 +17,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde_json::{Value, json};
 
 use crate::{framing::Frames, languages::ServerSpec, protocol::ProgressNote};
@@ -32,9 +32,45 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `shutdown` is given before the process is killed anyway. Being polite is worth
 /// a moment; waiting on it is not.
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(300);
-/// How long a server has to stay quiet before it is taken to be ready - see [`Readiness`].
-const SETTLING: Duration = Duration::from_secs(2);
+/// How long a server has to stay quiet about starting up before it is taken to have
+/// finished - see [`Readiness`].
+pub(crate) const SETTLING: Duration = Duration::from_secs(2);
+/// How long a server is allowed to be starting before readiness stops saying so, however
+/// little it has finished.
+///
+/// Being wrong about readiness has to degrade into "ask anyway and see", never into a pane
+/// that says "try again in a moment" for the rest of the session. Five minutes is longer
+/// than a cold rust-analyzer takes on a large workspace - measured at just under three on
+/// this one - so a server that has passed it is a server whose progress this client has
+/// misread, and the honest thing left is to let the question through.
+pub(crate) const STARTING_CEILING: Duration = Duration::from_secs(300);
+/// How long a request that came back `content modified` waits before it is asked again -
+/// see [`CONTENT_MODIFIED`].
+const RETRY_PAUSE: Duration = Duration::from_millis(250);
+/// What a server answers when the document moved under a request: JSON-RPC's
+/// `ContentModified`.
+///
+/// The protocol says this one is transient by definition - the question was about a document
+/// that has since changed, so the same question asked again is a different question and may
+/// well have an answer. It is retried once rather than shown, which is what makes readiness
+/// a hint rather than a gate.
+pub(crate) const CONTENT_MODIFIED: i64 = -32801;
 const READ_CHUNK: usize = 16 * 1024;
+
+/// Progress work whose token or title holds one of these is the server keeping a project it
+/// has already loaded up to date, not the server starting up.
+///
+/// A table rather than a chain of tests, and matched on rather than named exactly, because
+/// the tokens carry an index or a run number: rust-analyzer's checks arrive under
+/// `rust-analyzer/flycheck/0`, `.../1` and so on, under the title `cargo check`. The title is
+/// matched as well as the token, since the protocol lets a token be a bare number that says
+/// nothing about what it is.
+///
+/// Only what has actually been seen on the wire is listed - the two names above are one
+/// server's, and typescript-language-server announces no work at all. Anything unlisted
+/// counts as starting up, which is the safe way round: unknown work delays readiness rather
+/// than declaring it early, and [`STARTING_CEILING`] is what stops that delay being forever.
+const BACKGROUND_WORK: &[&str] = &["flycheck", "cargo check"];
 
 /// Which units the server counts a column in - see [`crate::protocol::lsp_character`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -48,29 +84,124 @@ pub enum PositionEncoding {
 /// Whether the server has finished starting, told from its progress notifications.
 ///
 /// This is the honest answer and the initialize reply is not: rust-analyzer answers
-/// `initialize` in milliseconds and then indexes for tens of seconds, and a request in
-/// between comes back empty or refused - which reads in a pane as "no definition found"
-/// rather than as "not yet".
+/// `initialize` in milliseconds and then reads, loads and indexes the project for minutes,
+/// and a request in between comes back empty or refused - which reads in a pane as "no
+/// definition found" rather than as "not yet".
 ///
-/// So readiness is: nothing the server announced is still outstanding, **and** it has been
-/// quiet for [`SETTLING`] since the last thing it said. The quiet is what makes this right
-/// for both kinds of server. One that announces nothing at all is ready once the window has
-/// passed. One that announces several pieces of work in a row - rust-analyzer fetches
-/// metadata, then loads, then indexes - passes through `outstanding == 0` in the gap between
-/// each pair of them, and calling that ready is how a request lands mid-indexing and comes
-/// back `content modified`.
-struct Readiness {
-    /// When the server last said anything about its own progress, starting from
-    /// `initialized`. The clock the quiet is measured on.
+/// The rule is in three parts, and each part is there for a failure that was actually seen:
+///
+/// - **Starting up is not the same as working.** Only work this client takes to be part of
+///   starting up counts, by its token - see [`BACKGROUND_WORK`]. rust-analyzer runs
+///   `cargo check` over a workspace for as long as the workspace is open, re-running it on
+///   every edit, and counting that as starting up is how a large project stays "still
+///   indexing" for the whole session.
+/// - **Quiet, not just an empty count.** A server announces the pieces of starting up one
+///   after another - fetch, scan the roots, load the proc-macros, prime the cache - and the
+///   outstanding work passes through empty in the gaps between them. So readiness also wants
+///   [`SETTLING`] of quiet, or a request lands in one of those gaps and comes back
+///   [`CONTENT_MODIFIED`].
+/// - **Once finished, finished.** Readiness latches. A server that has started does not go
+///   back to starting because it picked up some background work, and nothing a server says
+///   later can take a pane that was answering questions and stop it.
+///
+/// And over all three, [`STARTING_CEILING`]: past it the server is called ready whatever its
+/// progress said, because a misread of readiness must cost a request that comes back empty,
+/// not a session that never asks.
+pub(crate) struct Readiness {
+    /// When `initialized` went out, which is when starting up begins as far as this client
+    /// can see. What [`STARTING_CEILING`] is measured from.
+    initialized: Instant,
+    /// When the server last said anything about *starting up*. The clock the quiet is
+    /// measured on, and untouched by background work so that a project being checked in the
+    /// background can still fall quiet.
     last_spoke: Instant,
-    /// Work the server began and has not ended.
-    outstanding: usize,
+    /// The starting-up work the server began and has not ended, by its progress token.
+    starting_work: HashSet<String>,
+    /// The background work the server began and has not ended, by its progress token. Kept
+    /// because only a `begin` carries a title, so the reports and the end of a piece of work
+    /// can only be placed by remembering what its token was taken to be.
+    background_work: HashSet<String>,
+    /// Whether the server has finished starting. The latch: written once, and true from
+    /// then on.
+    finished_starting: bool,
 }
 
 impl Readiness {
-    fn is_ready(&self) -> bool {
-        self.outstanding == 0 && self.last_spoke.elapsed() >= SETTLING
+    /// A server that has just been told `initialized` and has announced nothing yet.
+    pub(crate) fn new() -> Self {
+        Self {
+            initialized: Instant::now(),
+            last_spoke: Instant::now(),
+            starting_work: HashSet::new(),
+            background_work: HashSet::new(),
+            finished_starting: false,
+        }
     }
+
+    /// Fold one `$/progress` notification into what is known about starting up.
+    ///
+    /// A notification with no token names no piece of work, and there is nothing honest to
+    /// do with it: it cannot be paired with the `begin` that would say what it is, so it is
+    /// left out of the reckoning rather than made into work with no identity.
+    pub(crate) fn follow(&mut self, message: &Value) {
+        let Some(token) = crate::protocol::progress_token(message) else {
+            return;
+        };
+        let kind = crate::protocol::progress_kind(message);
+        let title = crate::protocol::progress_note(message).title;
+
+        match kind {
+            Some("begin") if is_background_work(&token, title.as_deref()) => {
+                self.background_work.insert(token);
+            }
+            Some("begin") => {
+                self.starting_work.insert(token);
+                self.last_spoke = Instant::now();
+            }
+            Some("report") if !self.background_work.contains(&token) => {
+                // Part way through starting up is not finished starting up, so a report
+                // restarts the quiet just as a begin does.
+                self.last_spoke = Instant::now();
+            }
+            Some("end") => {
+                if self.background_work.remove(&token) {
+                    return;
+                }
+                self.starting_work.remove(&token);
+                self.last_spoke = Instant::now();
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether the server has finished starting, latching the answer the first time it has.
+    pub(crate) fn is_ready(&mut self) -> bool {
+        if self.finished_starting {
+            return true;
+        }
+        let settled = self.starting_work.is_empty() && self.last_spoke.elapsed() >= SETTLING;
+        self.finished_starting = settled || self.initialized.elapsed() >= STARTING_CEILING;
+        self.finished_starting
+    }
+
+    /// Move this server's clocks back, so a test can reach [`SETTLING`] or
+    /// [`STARTING_CEILING`] without spending it.
+    #[cfg(test)]
+    pub(crate) fn rewind(&mut self, by: Duration) {
+        let back = |instant: Instant| instant.checked_sub(by).unwrap_or(instant);
+        self.initialized = back(self.initialized);
+        self.last_spoke = back(self.last_spoke);
+    }
+}
+
+/// Whether a piece of announced work is the server keeping a loaded project up to date
+/// rather than starting up - see [`BACKGROUND_WORK`].
+fn is_background_work(token: &str, title: Option<&str>) -> bool {
+    let token = token.to_lowercase();
+    let title = title.unwrap_or_default().to_lowercase();
+    BACKGROUND_WORK
+        .iter()
+        .any(|marker| token.contains(marker) || title.contains(marker))
 }
 
 /// What one server is doing right now, as it last said in a `$/progress` notification.
@@ -123,8 +254,42 @@ pub fn follow_progress(working: &mut Option<Working>, kind: Option<&str>, note: 
     }
 }
 
+/// Why a server would not answer: what to tell the caller, and the JSON-RPC code where
+/// there was one.
+///
+/// The code is kept apart from the sentence because one of them is worth acting on:
+/// [`CONTENT_MODIFIED`] is a request the document moved under, and asking again is the
+/// answer. A timeout or a server that exited has no code, and nothing to retry.
+pub(crate) struct Refusal {
+    /// What the caller is told, already written as the sentence it will read as.
+    said: String,
+    /// The JSON-RPC error code, where the refusal came from the server rather than from
+    /// this side of the pipe.
+    code: Option<i64>,
+}
+
+impl Refusal {
+    /// Whether asking the same thing again is worth it.
+    ///
+    /// Only [`CONTENT_MODIFIED`] is: the protocol defines it as the document having changed
+    /// under the request, so the question was never really answered. Every other refusal is
+    /// the server's considered answer - a method it does not have, a position it will not
+    /// read - and asking twice would only be slower.
+    pub(crate) fn worth_asking_again(&self) -> bool {
+        self.code == Some(CONTENT_MODIFIED)
+    }
+}
+
+/// What the error object of an answer means, kept whole - see [`Refusal`].
+pub(crate) fn refusal_from(error: &Value) -> Refusal {
+    Refusal {
+        said: error.to_string(),
+        code: error.get("code").and_then(Value::as_i64),
+    }
+}
+
 /// The requests waiting for their answers, by the id they went out with.
-type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Result<Value, String>>>>>;
+type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Result<Value, Refusal>>>>>;
 
 /// One running language server, and everything asked of it.
 ///
@@ -158,11 +323,14 @@ impl LanguageServer {
     ///
     /// `search_path` is a `PATH` the command is looked for on and started with - see
     /// [`crate::languages::installed_at`]. It is the caller's, because where a user installs
-    /// their servers is the host application's business.
+    /// their servers is the host application's business. `client` is who the server is told
+    /// it is talking to, which is the caller's for the same reason - see
+    /// [`ClientIdentity`](crate::protocol::ClientIdentity).
     pub fn start(
         spec: &'static ServerSpec,
         repo_root: &std::path::Path,
         search_path: &str,
+        client: &crate::protocol::ClientIdentity,
     ) -> Result<Self> {
         let command_path = crate::languages::installed_at(spec.command, search_path)
             .ok_or_else(|| anyhow!("{} is not installed", spec.command))?;
@@ -182,10 +350,7 @@ impl LanguageServer {
         let stdout = child.stdout.take().context("the server has no stdout")?;
         let stderr = child.stderr.take().context("the server has no stderr")?;
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let readiness = Arc::new(Mutex::new(Readiness {
-            last_spoke: Instant::now(),
-            outstanding: 0,
-        }));
+        let readiness = Arc::new(Mutex::new(Readiness::new()));
         let working: Arc<Mutex<Option<Working>>> = Arc::new(Mutex::new(None));
 
         read_messages(
@@ -217,7 +382,7 @@ impl LanguageServer {
 
         let reply = server.request_with_timeout(
             "initialize",
-            crate::protocol::initialize_params(repo_root),
+            crate::protocol::initialize_params(repo_root, client),
             INITIALIZE_TIMEOUT,
         )?;
         let encoding = crate::protocol::agreed_encoding(&reply)?;
@@ -225,10 +390,7 @@ impl LanguageServer {
         server.notify("initialized", json!({}))?;
         // Readiness is counted from here rather than from the spawn: what came before is
         // the server reading the project, and what comes after is what it announces.
-        *server.readiness.lock().unwrap() = Readiness {
-            last_spoke: Instant::now(),
-            outstanding: 0,
-        };
+        *server.readiness.lock().unwrap() = Readiness::new();
         *server.working.lock().unwrap() = None;
 
         Ok(server)
@@ -242,8 +404,8 @@ impl LanguageServer {
             .expect("a started server has agreed an encoding")
     }
 
-    /// Whether the server has finished starting: nothing it announced is still
-    /// outstanding, and it has been quiet since the last thing it said.
+    /// Whether the server has finished starting - see [`Readiness`] for what that means and
+    /// why background work does not unmake it.
     pub fn is_ready(&self) -> bool {
         self.readiness.lock().unwrap().is_ready()
     }
@@ -281,9 +443,21 @@ impl LanguageServer {
     }
 
     /// Ask the server something and wait for its answer. A server that has stopped
-        /// answering gives an error rather than the calling thread.
+    /// answering gives an error rather than the calling thread.
+    ///
+    /// One answer is not taken at face value: [`CONTENT_MODIFIED`] means the document moved
+    /// while the question was in flight, so it is asked once more after [`RETRY_PAUSE`]
+    /// rather than handed back as "no answer". That is what makes readiness a hint - a
+    /// question let through a moment too early costs a retry, not a wrong answer in a pane.
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.request_with_timeout(method, params, REQUEST_TIMEOUT)
+        match self.ask(method, params.clone(), REQUEST_TIMEOUT) {
+            Err(refusal) if refusal.worth_asking_again() => {
+                std::thread::sleep(RETRY_PAUSE);
+                self.ask(method, params, REQUEST_TIMEOUT)
+                    .map_err(|refusal| anyhow!("{}", refusal.said))
+            }
+            answer => answer.map_err(|refusal| anyhow!("{}", refusal.said)),
+        }
     }
 
     fn request_with_timeout(
@@ -292,6 +466,18 @@ impl LanguageServer {
         params: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        self.ask(method, params, timeout)
+            .map_err(|refusal| anyhow!("{}", refusal.said))
+    }
+
+    /// One round trip, with the server's refusal kept whole so the caller can tell a
+    /// transient one from a real one.
+    fn ask(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> std::result::Result<Value, Refusal> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
         self.pending.lock().unwrap().insert(id, sender);
@@ -302,19 +488,28 @@ impl LanguageServer {
         );
         if let Err(error) = sent {
             self.pending.lock().unwrap().remove(&id);
-            return Err(error);
+            return Err(Refusal {
+                said: error.to_string(),
+                code: None,
+            });
         }
 
         match receiver.recv_timeout(timeout) {
             Ok(Ok(result)) => Ok(result),
-            Ok(Err(refusal)) => bail!("{} refused {method}: {refusal}", self.name),
+            Ok(Err(refusal)) => Err(Refusal {
+                said: format!("{} refused {method}: {}", self.name, refusal.said),
+                code: refusal.code,
+            }),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                bail!(
-                    "{} did not answer {method} within {} seconds",
-                    self.name,
-                    timeout.as_secs()
-                )
+                Err(Refusal {
+                    said: format!(
+                        "{} did not answer {method} within {} seconds",
+                        self.name,
+                        timeout.as_secs()
+                    ),
+                    code: None,
+                })
             }
         }
     }
@@ -384,7 +579,10 @@ fn read_messages(
         // The server is gone. Everyone waiting on it is told now rather than sitting out
         // their whole timeout.
         for (_, waiting) in pending.lock().unwrap().drain() {
-            let _ = waiting.send(Err("the language server exited".to_string()));
+            let _ = waiting.send(Err(Refusal {
+                said: "the language server exited".to_string(),
+                code: None,
+            }));
         }
     });
 }
@@ -410,20 +608,13 @@ fn handle_message(
             );
         }
         (Some("$/progress"), None) => {
-            let kind = crate::protocol::progress_kind(message);
-            let mut readiness = readiness.lock().unwrap();
-            // Anything it says about its own work restarts the quiet, `report` included: a
-            // server part way through indexing is a server that has not finished.
-            readiness.last_spoke = Instant::now();
-            match kind {
-                Some("begin") => readiness.outstanding += 1,
-                Some("end") => readiness.outstanding = readiness.outstanding.saturating_sub(1),
-                _ => {}
-            }
-            drop(readiness);
+            readiness.lock().unwrap().follow(message);
+            // What the status bar reads out takes every piece of work, background or not: a
+            // person watching a `cargo check` run wants to see it, even though it says
+            // nothing about whether the server has finished starting.
             follow_progress(
                 &mut working.lock().unwrap(),
-                kind,
+                crate::protocol::progress_kind(message),
                 crate::protocol::progress_note(message),
             );
         }
@@ -436,7 +627,7 @@ fn handle_message(
                 return;
             };
             let answer = match message.get("error") {
-                Some(error) => Err(error.to_string()),
+                Some(error) => Err(refusal_from(error)),
                 None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
             };
             let _ = waiting.send(answer);

@@ -81,6 +81,138 @@ fn a_real_language_server_says_where_a_symbol_is_defined() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The reported bug: go-to-definition on a real Rust project answered "rust is still
+/// indexing this project - try again in a moment" and went on saying it for the whole
+/// session.
+///
+/// What no fixture catches is that rust-analyzer never falls silent on a project somebody is
+/// working in: it checks the workspace with `cargo check` when the project loads and again
+/// after every edit, and the rule this test guards used to read that checking as the server
+/// still starting up. So the shape of the test is the shape of the use: open a real file in a
+/// real cargo workspace, wait for `Ready`, then keep editing and keep watching, and the
+/// status must not drop back to `Starting` - and the server must still answer.
+///
+/// The workspace is the outermost cargo project this checkout sits in - the whole repo where
+/// this crate is vendored into one, and this crate alone where it is checked out on its own.
+/// The bigger the workspace, the more checking there is to mistake for starting up.
+///
+/// `#[ignore]`d like the others: it starts rust-analyzer, waits out the indexing of a real
+/// project, and then spends half a minute watching it.
+#[test]
+#[ignore]
+fn a_real_rust_server_stays_ready_while_it_goes_on_checking_the_project() {
+    let root = outermost_cargo_project();
+    println!("workspace: {}", root.display());
+    let file_path = "crates/moon_lsp/src/framing.rs";
+    let file_path = if root.join(file_path).is_file() {
+        file_path
+    } else {
+        "src/framing.rs"
+    };
+    let text = std::fs::read_to_string(root.join(file_path)).expect("failed to read the file");
+
+    let servers = registry();
+    let repo = Workspace {
+        key: WORKSPACE,
+        root: &root,
+    };
+    servers
+        .did_open(&repo, file_path, &text)
+        .expect("failed to open the document");
+    let started_at = Instant::now();
+    wait_until_ready(&servers, file_path, Duration::from_secs(300));
+    println!("ready after {:?}", started_at.elapsed());
+
+    // Now the part that was broken. Each edit sets rust-analyzer checking the project again,
+    // and every one of those checks used to read as the server starting over.
+    for edit in 0..4 {
+        let edited = format!("{text}\n// an edit, the {edit}th\n");
+        servers
+            .did_change(&repo, file_path, &edited)
+            .expect("failed to send the edit");
+        let watching_until = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < watching_until {
+            let status = servers.status(WORKSPACE, file_path);
+            assert_eq!(
+                status,
+                LspStatus::Ready,
+                "edit {edit}: a server that has started must not go back to starting because \
+                 it is checking the project - {:?}",
+                working_titles(&servers)
+            );
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        println!("edit {edit}: still ready, working: {:?}", working_titles(&servers));
+    }
+
+    // And it is not only saying it is ready: the question it was refusing to be asked is
+    // asked here, on the text as it now stands.
+    let edited = format!("{text}\n// an edit, the last\n");
+    servers
+        .did_change(&repo, file_path, &edited)
+        .expect("failed to send the last edit");
+    let call = "content_length(&header)";
+    let line = edited
+        .lines()
+        .position(|line| line.contains(&format!("= {call}")))
+        .expect("expected the call to content_length");
+    let column = edited
+        .lines()
+        .nth(line)
+        .expect("expected that line")
+        .find(call)
+        .expect("expected the call on that line")
+        + 1;
+    let locations = servers
+        .definition(
+            &repo,
+            file_path,
+            LspPosition { line, column },
+        )
+        .expect("failed to ask where content_length is defined");
+    println!(
+        "definition: {:?}",
+        locations
+            .iter()
+            .map(|location| (&location.file_path, location.line_number))
+            .collect::<Vec<_>>()
+    );
+    let defined_at = edited
+        .lines()
+        .position(|line| line.starts_with("fn content_length("))
+        .expect("expected content_length to be defined in this file")
+        + 1;
+    assert_eq!(locations.len(), 1, "expected one definition");
+    assert_eq!(locations[0].line_number, defined_at);
+
+    servers
+        .did_close(&repo, file_path)
+        .expect("failed to close the document");
+}
+
+/// What every server running for this workspace says it is doing, as titles - which is what
+/// a status bar would be showing while the test watches.
+fn working_titles(servers: &LspRegistry) -> Vec<String> {
+    servers
+        .working(WORKSPACE)
+        .iter()
+        .map(|work| format!("{}: {}", work.server, work.title))
+        .collect()
+}
+
+/// The outermost cargo project this crate sits in: the repo where it is vendored into one,
+/// and the crate itself where it is checked out on its own. What the test above wants is the
+/// largest real workspace at hand, since the mistake it guards against grows with the amount
+/// of work the server does.
+fn outermost_cargo_project() -> PathBuf {
+    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    here.ancestors()
+        .filter(|directory| directory.join("Cargo.toml").is_file())
+        .last()
+        .expect("this crate has a Cargo.toml")
+        .to_path_buf()
+}
+
 /// A registry that looks for its servers on this process's own `PATH`, which is the one
 /// `cargo test` was started with and so the one the servers were installed on.
 fn registry() -> LspRegistry {

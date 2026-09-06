@@ -4,16 +4,181 @@
 //! All of it is arithmetic and tables, so it runs in the normal suite. The proof that the
 //! whole path works needs a real server and lives in `tests/real_servers.rs`, `#[ignore]`d.
 
+use std::time::Duration;
+
 use serde_json::json;
 
 use crate::{
     framing::{self, Frames},
     languages,
-    payload::{LspPosition, LspStatus},
-    process::{PositionEncoding, Working, follow_progress},
+    payload::{LspCompletionKind, LspPosition, LspStatus},
+    process::{
+        PositionEncoding, Readiness, SETTLING, STARTING_CEILING, Working, follow_progress,
+        refusal_from,
+    },
     protocol,
     registry::{LspRegistry, status_without_a_server},
 };
+
+/// One `$/progress` notification, as a server puts it on the wire.
+fn progress(token: &str, value: serde_json::Value) -> serde_json::Value {
+    json!({ "jsonrpc": "2.0", "method": "$/progress", "params": { "token": token, "value": value } })
+}
+
+/// The reported bug, in the notifications rust-analyzer really sends on a large workspace:
+/// it primes its cache, starts checking the project with `cargo check` before that has
+/// finished, and then goes on checking - on every edit, for as long as the workspace is open.
+///
+/// The rule this replaced measured its quiet on every notification alike, so the checking
+/// kept the server `Starting` and every go-to-definition came back "rust is still indexing
+/// this project - try again in a moment" for the rest of the session.
+#[test]
+fn a_server_that_keeps_checking_the_project_after_it_has_started_becomes_and_stays_ready() {
+    let mut readiness = Readiness::new();
+
+    readiness.follow(&progress(
+        "rustAnalyzer/cachePriming",
+        json!({ "kind": "begin", "title": "Indexing" }),
+    ));
+    readiness.follow(&progress(
+        "rust-analyzer/flycheck/0",
+        json!({ "kind": "begin", "title": "cargo check" }),
+    ));
+    readiness.rewind(SETTLING);
+    assert!(
+        !readiness.is_ready(),
+        "the cache is still being primed, which is the server starting up"
+    );
+
+    readiness.follow(&progress("rustAnalyzer/cachePriming", json!({ "kind": "end" })));
+    readiness.rewind(SETTLING);
+    assert!(
+        readiness.is_ready(),
+        "starting up has finished, and a check running in the background is not starting up"
+    );
+
+    // And now the checking goes on, the way it does while a person edits: a run every few
+    // seconds, each one reporting as it goes.
+    for run in 0..5 {
+        let token = format!("rust-analyzer/flycheck/{run}");
+        readiness.follow(&progress(
+            &token,
+            json!({ "kind": "begin", "title": "cargo check" }),
+        ));
+        readiness.follow(&progress(
+            &token,
+            json!({ "kind": "report", "message": "checking moon_lsp" }),
+        ));
+        readiness.follow(&progress(&token, json!({ "kind": "end" })));
+        assert!(
+            readiness.is_ready(),
+            "run {run} of a background check must not put a started server back to starting"
+        );
+    }
+}
+
+/// The other way round, and the bug the quiet was added for: rust-analyzer announces the
+/// pieces of starting up one after another - fetch, scan the roots, load the proc-macros,
+/// prime the cache - and the outstanding work passes through empty in the gaps between them.
+///
+/// A request let through in one of those gaps comes back `content modified` or empty, which
+/// reads as "no definition found" for a symbol that has one.
+#[test]
+fn a_server_announcing_its_startup_work_in_a_row_is_not_ready_in_the_gap_between_two_pieces() {
+    let mut readiness = Readiness::new();
+    let pieces = [
+        ("rustAnalyzer/Fetching", "Fetching"),
+        ("rustAnalyzer/Building CrateGraph", "Building CrateGraph"),
+        ("rustAnalyzer/Roots Scanned", "Roots Scanned"),
+        ("rustAnalyzer/cachePriming", "Indexing"),
+    ];
+
+    for (token, title) in pieces {
+        readiness.follow(&progress(token, json!({ "kind": "begin", "title": title })));
+        assert!(!readiness.is_ready(), "{title} has not finished");
+        readiness.follow(&progress(token, json!({ "kind": "end" })));
+        assert!(
+            !readiness.is_ready(),
+            "nothing is outstanding after {title}, but the next piece of starting up is a \
+             moment away and a request sent now lands mid-startup"
+        );
+    }
+
+    readiness.rewind(SETTLING);
+    assert!(
+        readiness.is_ready(),
+        "the quiet after the last piece is what says starting up is over"
+    );
+}
+
+/// Nothing the server says afterwards can take a pane that was answering questions and stop
+/// it: readiness latches. A server that begins a piece of work this client cannot place - a
+/// server not in [`crate::process`]'s table of background work, or one whose own re-indexing
+/// looks like starting up - is a server that has already started.
+#[test]
+fn work_a_server_begins_after_it_has_started_never_puts_it_back_to_starting() {
+    let mut readiness = Readiness::new();
+    readiness.rewind(SETTLING);
+    assert!(readiness.is_ready(), "a server that announced nothing at all");
+
+    readiness.follow(&progress(
+        "some/unfamiliar/work",
+        json!({ "kind": "begin", "title": "Re-indexing" }),
+    ));
+    readiness.follow(&progress(
+        "some/unfamiliar/work",
+        json!({ "kind": "report", "message": "half way" }),
+    ));
+
+    assert!(
+        readiness.is_ready(),
+        "a started server that picked up more work is still a started server"
+    );
+}
+
+/// Whatever else is true, a misread of readiness has to cost a request that comes back empty
+/// rather than a session that never asks. A server whose starting-up work never ends is let
+/// through once the ceiling has passed.
+#[test]
+fn a_server_whose_startup_work_never_ends_is_let_through_once_the_ceiling_has_passed() {
+    let mut readiness = Readiness::new();
+    readiness.follow(&progress(
+        "rustAnalyzer/Roots Scanned",
+        json!({ "kind": "begin", "title": "Roots Scanned" }),
+    ));
+
+    readiness.rewind(STARTING_CEILING - Duration::from_secs(1));
+    assert!(
+        !readiness.is_ready(),
+        "the scan is still outstanding and there is still time for it"
+    );
+
+    readiness.rewind(Duration::from_secs(2));
+    assert!(
+        readiness.is_ready(),
+        "past the ceiling the question is asked anyway rather than waited on forever"
+    );
+}
+
+/// `content modified` is the one refusal worth asking twice about: the protocol defines it as
+/// the document having changed under the request, so the question was never answered. Every
+/// other refusal is the server's answer.
+#[test]
+fn a_request_the_document_moved_under_is_worth_asking_again_and_no_other_refusal_is() {
+    assert!(
+        refusal_from(&json!({ "code": -32801, "message": "content modified" }))
+            .worth_asking_again()
+    );
+    assert!(
+        !refusal_from(&json!({ "code": -32601, "message": "method not found" }))
+            .worth_asking_again(),
+        "a method the server does not have will not appear on a second ask"
+    );
+    assert!(
+        !refusal_from(&json!({ "message": "no code at all" })).worth_asking_again(),
+        "a refusal with no code is nothing this client can act on"
+    );
+}
 
 #[test]
 fn a_message_goes_out_with_its_length_in_bytes_ahead_of_it() {
@@ -378,6 +543,41 @@ fn a_definition_outside_the_repo_keeps_the_path_that_names_it() {
     );
 }
 
+/// What a caller decides with: whether an item is a function is the one thing that says
+/// whether taking it should write the parentheses of a call, and the kind is the only place
+/// the answer comes from. An item with no kind stays an item with no kind - a server that did
+/// not say is not a server that said "variable".
+#[test]
+fn a_completion_keeps_the_kind_the_server_gave_it_and_none_where_it_gave_none() {
+    let answer = json!([
+        { "label": "greet", "kind": 3, "detail": "fn(&str) -> String" },
+        { "label": "greeting", "kind": 6 },
+        { "label": "Greeter", "kind": 22, "insertText": "Greeter" },
+        { "label": "grep" },
+        // The kinds are a bare integer on the wire, so a server may send one newer than the
+        // list this client was written against. Carried as nothing rather than guessed at.
+        { "label": "growl", "kind": 99 },
+    ]);
+
+    let completions = protocol::completions_from(answer).expect("expected a readable list");
+    let kinds: Vec<Option<LspCompletionKind>> =
+        completions.iter().map(|item| item.kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            Some(LspCompletionKind::Function),
+            Some(LspCompletionKind::Variable),
+            Some(LspCompletionKind::Struct),
+            None,
+            None,
+        ]
+    );
+    // And the three fields that were already carried are still carried beside it.
+    assert_eq!(completions[0].label, "greet");
+    assert_eq!(completions[0].detail.as_deref(), Some("fn(&str) -> String"));
+    assert_eq!(completions[0].insert, "greet");
+}
+
 #[test]
 fn a_file_uri_escapes_what_a_path_may_hold_and_reads_back_the_same() {
     let path = std::path::Path::new("/tmp/a repo/src/café.rs");
@@ -409,4 +609,51 @@ fn a_server_asking_for_its_configuration_is_answered_one_entry_per_item() {
         "a server handed the wrong number of settings stops asking"
     );
     assert!(protocol::reply_to_server_request("client/registerCapability", &asked).is_null());
+}
+
+/// What a server is told it is talking to when nobody said: this crate, not whatever
+/// application happens to vendor it. The name goes into every server's log and a few servers
+/// change what they offer by it, so a library that announced one host application's name would
+/// be lying to every other caller - and to its own example.
+#[test]
+fn a_server_is_told_it_is_talking_to_this_crate_when_the_caller_says_nothing() {
+    let params = protocol::initialize_params(
+        std::path::Path::new("/tmp/a repo"),
+        &crate::ClientIdentity::default(),
+    );
+    assert_eq!(
+        params.pointer("/clientInfo/name").and_then(|it| it.as_str()),
+        Some("moon_lsp")
+    );
+    assert_eq!(
+        params.pointer("/clientInfo/version").and_then(|it| it.as_str()),
+        Some(env!("CARGO_PKG_VERSION")),
+        "a version is worth sending: it is what tells one bug report from another"
+    );
+}
+
+/// A caller that says who it is has that go out instead, version and all. A caller with no
+/// version to give sends no version rather than an empty one.
+#[test]
+fn a_caller_that_says_who_it_is_has_its_own_name_and_version_sent() {
+    let params = protocol::initialize_params(
+        std::path::Path::new("/tmp/a repo"),
+        &crate::ClientIdentity::new("moonreview", "0.20.0"),
+    );
+    assert_eq!(
+        params.pointer("/clientInfo").expect("expected a clientInfo"),
+        &json!({ "name": "moonreview", "version": "0.20.0" })
+    );
+
+    let versionless = protocol::initialize_params(
+        std::path::Path::new("/tmp/a repo"),
+        &crate::ClientIdentity {
+            name: "a script".to_string(),
+            version: None,
+        },
+    );
+    assert_eq!(
+        versionless.pointer("/clientInfo").expect("expected a clientInfo"),
+        &json!({ "name": "a script" })
+    );
 }

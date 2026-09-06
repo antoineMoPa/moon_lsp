@@ -34,12 +34,15 @@
 //! repo root and an opaque key, and the caller decides whether that key is the repo, one
 //! window's work, or anything else.
 //!
-//! Two other things are the caller's on purpose. The `PATH` servers are looked for and
+//! Three other things are the caller's on purpose. The `PATH` servers are looked for and
 //! started on is handed to [`LspRegistry::new`], because a window started from a desktop
 //! launcher has a `PATH` with nothing on it and only the host application knows where its
-//! user really installs things. And the debouncing of [`LspRegistry::did_change`] is the
-//! caller's, since a round trip per keystroke is a flood wherever this is reached over a
-//! network.
+//! user really installs things. The name a server is told it is talking to is handed to
+//! [`LspRegistry::identifying_as`] for the same reason - a library cannot know whose program
+//! it is inside, and what it says about that goes into every server's log, so said nothing
+//! about it says `moon_lsp` and this crate's version rather than guessing. And the debouncing
+//! of [`LspRegistry::did_change`] is the caller's, since a round trip per keystroke is a flood
+//! wherever this is reached over a network.
 //!
 //! # The parts
 //!
@@ -58,7 +61,10 @@ pub mod process;
 pub mod protocol;
 pub mod registry;
 
-pub use payload::{LspCompletion, LspLocation, LspPosition, LspStatus, LspWork};
+pub use payload::{
+    LspCompletion, LspCompletionKind, LspLocation, LspPosition, LspStatus, LspWork,
+};
+pub use protocol::ClientIdentity;
 pub use registry::{LspRegistry, Workspace};
 
 #[cfg(test)]
