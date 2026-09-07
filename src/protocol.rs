@@ -94,7 +94,10 @@ pub fn initialize_params(repo_root: &std::path::Path, client: &ClientIdentity) -
                 "definition": { "linkSupport": true },
                 "completion": {
                     "completionItem": { "snippetSupport": false },
-                    "contextSupport": false,
+                    // Every completion request says why it is being asked - see
+                    // [`AskedBecause`] - and a server only reads that from a client that
+                    // said it would send it.
+                    "contextSupport": true,
                 },
             },
         },
@@ -108,6 +111,87 @@ pub fn agreed_encoding(initialize_reply: &Value) -> Result<PositionEncoding> {
     let result: InitializeResult = serde_json::from_value(initialize_reply.clone())
         .context("the language server's initialize reply could not be read")?;
     Ok(encoding_of(&result.capabilities))
+}
+
+/// The characters the server itself said should open a completion list, out of the
+/// `completionProvider` of its `initialize` reply.
+///
+/// This is the answer to "when should a list pop up without a word being typed", and it is
+/// the server's rather than anybody's guess: rust-analyzer names `.`, `:`, `'` and `(`,
+/// typescript-language-server names `.`, `"`, `'`, `/`, `@` and `<`, and the two lists have
+/// only one character in common. A table written here would be a table of one language's
+/// punctuation applied to every language, which is exactly what the reply exists to save
+/// anybody from.
+///
+/// Empty for a server that declared none, and empty for one that offers no completions at
+/// all. Both mean the same thing to whoever is deciding whether to ask: nothing here opens a
+/// list on its own, so only a word being typed does.
+///
+/// The protocol calls each of these a character and sends it as a string. A server that
+/// declares a string of several is declaring something no keystroke can ever be, so it is
+/// dropped rather than half-matched: a trigger is compared against the one character just
+/// typed, and there is nothing here that could compare it against two.
+pub fn trigger_characters(initialize_reply: &Value) -> Result<Vec<char>> {
+    let result: InitializeResult = serde_json::from_value(initialize_reply.clone())
+        .context("the language server's initialize reply could not be read")?;
+    Ok(triggers_of(&result.capabilities))
+}
+
+fn triggers_of(capabilities: &ServerCapabilities) -> Vec<char> {
+    let Some(completion) = capabilities.completion_provider.as_ref() else {
+        return Vec::new();
+    };
+    completion
+        .trigger_characters
+        .iter()
+        .flatten()
+        .filter_map(|trigger| {
+            let mut characters = trigger.chars();
+            characters.next().filter(|_| characters.next().is_none())
+        })
+        .collect()
+}
+
+/// Why a server is being asked what could be typed, which is the `context` of
+/// `textDocument/completion`.
+///
+/// Worth sending, and the reason the request carries it: a server told that a `.` was just
+/// typed answers with the members of what is to the left of it, and the same server asked
+/// the same position with nothing said about why answers with everything in scope, in
+/// another order. The protocol has a field for the difference because the answers really are
+/// different.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AskedBecause {
+    /// One of the characters the server named in [`trigger_characters`] has just been typed,
+    /// and is what the caret is sitting behind.
+    OneOfItsTriggersWasTyped(char),
+    /// Anything else: a word is being typed, or somebody asked for the list outright.
+    SomebodyIsTyping,
+}
+
+impl AskedBecause {
+    /// The `context` of the request. The kinds are the protocol's own numbering: 1 is a
+    /// client that asked, 2 is a trigger character.
+    fn as_context(self) -> Value {
+        match self {
+            Self::OneOfItsTriggersWasTyped(typed) => {
+                json!({ "triggerKind": 2, "triggerCharacter": typed.to_string() })
+            }
+            Self::SomebodyIsTyping => json!({ "triggerKind": 1 }),
+        }
+    }
+}
+
+/// A question about what could be typed at one place, and why it is being asked.
+pub fn completion_params(
+    uri: &str,
+    line: usize,
+    character: u32,
+    because: AskedBecause,
+) -> Value {
+    let mut params = position_params(uri, line, character);
+    params["context"] = because.as_context();
+    params
 }
 
 fn encoding_of(capabilities: &ServerCapabilities) -> PositionEncoding {
@@ -394,6 +478,27 @@ pub fn line_of(text: &str, line: usize) -> Option<&str> {
     text.split('\n')
         .nth(line)
         .map(|line| line.trim_end_matches('\r'))
+}
+
+/// The character immediately before a position, which is the one just typed when the
+/// position is a caret and somebody is typing.
+///
+/// It is what says whether a completion is being asked for because of a trigger character:
+/// the caret in `thing.|` sits behind a `.`, and whether that `.` means anything is the
+/// server's own list to say - see [`trigger_characters`].
+///
+/// Counted in the editor's bytes rather than the server's units, because it is read against
+/// the text this side holds. `None` at the start of a line and past the end of the file. A
+/// column landing inside a character belongs to that character, exactly as it does in
+/// [`lsp_character`], so the answer is the character before *that* one.
+pub fn character_before(text: &str, at: &LspPosition) -> Option<char> {
+    let line = line_of(text, at.line)?;
+    let column = at.column.min(line.len());
+    let cut = (0..=column)
+        .rev()
+        .find(|index| line.is_char_boundary(*index))
+        .unwrap_or(0);
+    line[..cut].chars().next_back()
 }
 
 /// The position a request goes out with, in the server's own units.

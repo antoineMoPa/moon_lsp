@@ -17,7 +17,7 @@ use crate::{
     languages::{self, ExtensionSpec, ServerSpec},
     payload::{LspCompletion, LspLocation, LspPosition, LspStatus, LspWork},
     process::{LanguageServer, PositionEncoding},
-    protocol::{self, ClientIdentity},
+    protocol::{self, AskedBecause, ClientIdentity},
 };
 
 /// The repo a question is about: where its files are, and what its servers are held under.
@@ -106,6 +106,30 @@ impl LspRegistry {
     ) -> Option<PositionEncoding> {
         self.running(&(workspace_key.to_string(), server_name))
             .map(|server| server.encoding())
+    }
+
+    /// The characters the server behind this file said should open a completion list on
+    /// their own - `.` and `:` for rust-analyzer, `.` and `/` and four more for
+    /// typescript-language-server.
+    ///
+    /// Asked by file rather than by server name because that is what a caller has in hand,
+    /// and answered out of the running server rather than out of a table here: the list is
+    /// the server's own, said once in its `initialize` reply - see
+    /// [`protocol::trigger_characters`].
+    ///
+    /// Empty for a file nothing serves, for a server that has not started yet, and for one
+    /// that named none. All three mean the same thing to a caller deciding whether to ask
+    /// without a word being typed: nothing here opens a list on its own. A caller that asks
+    /// before the server is up asks again once it is ready, which is the same wait every
+    /// other question about a starting server sits out.
+    pub fn trigger_characters(&self, workspace_key: &str, file_path: &str) -> Vec<char> {
+        let Some(language) = languages::for_file(file_path) else {
+            return Vec::new();
+        };
+        let key = (workspace_key.to_string(), language.server.name);
+        self.running(&key)
+            .map(|server| server.trigger_characters().to_vec())
+            .unwrap_or_default()
     }
 
     /// Every server running for one workspace, with the name it is known by. What a caller
@@ -319,6 +343,13 @@ impl LspRegistry {
     }
 
     /// What could be typed at this place. Empty when the server offers nothing.
+    ///
+    /// The request says why it is being asked, which the server is told rather than left to
+    /// work out: a `.` just typed gets the members of what is to its left, and the same
+    /// position asked about with nothing said gets everything in scope. Why is read here
+    /// rather than taken from the caller because it is this side that knows both halves -
+    /// the character the caret sits behind, off the text the server was told this file
+    /// holds, and the characters that server itself named as its triggers.
     pub fn completion(
         &self,
         workspace: &Workspace<'_>,
@@ -330,7 +361,12 @@ impl LspRegistry {
         };
         let answer = question.server.request(
             "textDocument/completion",
-            protocol::position_params(&question.uri, at.line, question.character),
+            protocol::completion_params(
+                &question.uri,
+                at.line,
+                question.character,
+                question.because(),
+            ),
         )?;
         protocol::completions_from(answer)
     }
@@ -365,10 +401,12 @@ impl LspRegistry {
 
         let uri = protocol::file_uri(&workspace.root.join(file_path));
         let character = protocol::position_in(&text, at, server.encoding())?;
+        let typed = protocol::character_before(&text, at);
         Ok(Some(Question {
             server,
             uri,
             character,
+            typed,
         }))
     }
 }
@@ -380,6 +418,23 @@ struct Question {
     uri: String,
     /// The column, already converted - see [`protocol::lsp_character`].
     character: u32,
+    /// The character the position sits behind, off the text this side last told the server
+    /// the file holds - see [`protocol::character_before`].
+    typed: Option<char>,
+}
+
+impl Question {
+    /// Why the server is being asked what could be typed here: one of its own triggers has
+    /// just been typed, or a word is being finished. A character the server never named is
+    /// no reason at all, however much punctuation it looks like.
+    fn because(&self) -> AskedBecause {
+        match self.typed {
+            Some(typed) if self.server.trigger_characters().contains(&typed) => {
+                AskedBecause::OneOfItsTriggersWasTyped(typed)
+            }
+            _ => AskedBecause::SomebodyIsTyping,
+        }
+    }
 }
 
 /// What to say about a file before any running server is looked at.

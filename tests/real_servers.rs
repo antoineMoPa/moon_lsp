@@ -64,6 +64,17 @@ fn a_real_language_server_says_where_a_symbol_is_defined() {
         "greet is defined on the first line"
     );
 
+    // What the server itself says should open a completion list, kept out of its
+    // `initialize` reply rather than guessed at here. This one names `.`, `"`, `'`, `/`, `@`
+    // and `<`; the assertion is on the one character every language agrees on, so a version
+    // that adds or drops one of the others does not fail a test about something else.
+    let triggers = servers.trigger_characters(WORKSPACE, "main.ts");
+    println!("triggers: {triggers:?}");
+    assert!(
+        triggers.contains(&'.'),
+        "expected a server that completes members after a dot to say so"
+    );
+
     let completions = servers
         .completion(&repo, "main.ts", at)
         .expect("failed to ask what could be typed");

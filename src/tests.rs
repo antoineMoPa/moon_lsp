@@ -657,3 +657,128 @@ fn a_caller_that_says_who_it_is_has_its_own_name_and_version_sent() {
         &json!({ "name": "a script" })
     );
 }
+
+/// The lists the two servers on this machine really send, kept rather than thrown away: the
+/// `.` that means "what is on this thing" is the only character both of them name, so the
+/// only honest source for the rest is the reply itself.
+#[test]
+fn the_trigger_characters_a_server_names_in_its_reply_are_kept_as_it_named_them() {
+    let rust = json!({
+        "capabilities": {
+            "completionProvider": {
+                "resolveProvider": false,
+                "triggerCharacters": [":", ".", "'", "("],
+            }
+        }
+    });
+    assert_eq!(
+        protocol::trigger_characters(&rust).expect("expected a readable reply"),
+        [':', '.', '\'', '(']
+    );
+
+    let typescript = json!({
+        "capabilities": {
+            "completionProvider": {
+                "triggerCharacters": [".", "\"", "'", "/", "@", "<"],
+                "resolveProvider": true,
+            }
+        }
+    });
+    assert_eq!(
+        protocol::trigger_characters(&typescript).expect("expected a readable reply"),
+        ['.', '"', '\'', '/', '@', '<']
+    );
+}
+
+/// Every way of a server naming nothing comes to the same empty list: one that offers
+/// completions without naming a trigger, and one that offers no completions at all. And a
+/// server that names something no keystroke can be - the protocol says a character, and
+/// `->` is two - has named nothing that could ever match one, so it is dropped rather than
+/// half-matched.
+#[test]
+fn a_server_that_names_no_triggers_or_names_something_no_keystroke_can_be_triggers_on_nothing() {
+    let no_triggers = json!({ "capabilities": { "completionProvider": {} } });
+    assert!(
+        protocol::trigger_characters(&no_triggers)
+            .expect("expected a readable reply")
+            .is_empty()
+    );
+
+    let no_completions = json!({ "capabilities": {} });
+    assert!(
+        protocol::trigger_characters(&no_completions)
+            .expect("expected a readable reply")
+            .is_empty()
+    );
+
+    let two_characters = json!({
+        "capabilities": { "completionProvider": { "triggerCharacters": ["->", ".", ""] } }
+    });
+    assert_eq!(
+        protocol::trigger_characters(&two_characters).expect("expected a readable reply"),
+        ['.']
+    );
+}
+
+/// A completion request says why it is being asked, because the answers really are
+/// different: a server told a `.` was just typed answers with the members of what is to the
+/// left of it, and the same server asked the same place with nothing said answers with
+/// everything in scope.
+#[test]
+fn a_completion_asked_after_a_trigger_says_which_one_and_one_asked_while_typing_says_neither() {
+    let after_a_dot = protocol::completion_params(
+        "file:///tmp/a.rs",
+        4,
+        18,
+        protocol::AskedBecause::OneOfItsTriggersWasTyped('.'),
+    );
+    assert_eq!(
+        after_a_dot.pointer("/context").expect("expected a context"),
+        &json!({ "triggerKind": 2, "triggerCharacter": "." })
+    );
+    // And it is still a question about the same place, in the server's own units.
+    assert_eq!(
+        after_a_dot.pointer("/position").expect("expected a position"),
+        &json!({ "line": 4, "character": 18 })
+    );
+
+    let while_typing = protocol::completion_params(
+        "file:///tmp/a.rs",
+        4,
+        18,
+        protocol::AskedBecause::SomebodyIsTyping,
+    );
+    assert_eq!(
+        while_typing.pointer("/context").expect("expected a context"),
+        &json!({ "triggerKind": 1 })
+    );
+
+    // A server only reads a context off a client that said it would send one.
+    let params = protocol::initialize_params(
+        std::path::Path::new("/tmp/a repo"),
+        &crate::ClientIdentity::default(),
+    );
+    assert_eq!(
+        params.pointer("/capabilities/textDocument/completion/contextSupport"),
+        Some(&json!(true))
+    );
+}
+
+/// The character a caret sits behind, which is what says a trigger was just typed. Counted
+/// in the editor's bytes against the text this side holds, so a line with an accent on it
+/// answers with the character rather than with half of one.
+#[test]
+fn the_character_a_caret_sits_behind_is_read_off_the_text_this_side_holds() {
+    let text = "let x = thing.\nlet café = 1;\n";
+    let behind = |line, column| protocol::character_before(text, &LspPosition { line, column });
+
+    assert_eq!(behind(0, "let x = thing.".len()), Some('.'));
+    assert_eq!(behind(0, "let x = thing".len()), Some('g'));
+    // The start of a line is behind nothing, and neither is a line past the end of the file.
+    assert_eq!(behind(0, 0), None);
+    assert_eq!(behind(9, 0), None);
+    // `é` is two bytes: a column past it answers with it, and one landing inside it belongs
+    // to it and answers with what is before it.
+    assert_eq!(behind(1, "let café".len()), Some('é'));
+    assert_eq!(behind(1, "let caf".len() + 1), Some('f'));
+}

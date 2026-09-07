@@ -64,7 +64,7 @@ pub mod registry;
 pub use payload::{
     LspCompletion, LspCompletionKind, LspLocation, LspPosition, LspStatus, LspWork,
 };
-pub use protocol::ClientIdentity;
+pub use protocol::{AskedBecause, ClientIdentity};
 pub use registry::{LspRegistry, Workspace};
 
 #[cfg(test)]

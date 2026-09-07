@@ -301,6 +301,12 @@ pub struct LanguageServer {
     /// What the server agreed to count columns in, out of its `initialize` reply. Written
     /// once, by [`LanguageServer::start`], before anybody else has the server at all.
     encoding: OnceLock<PositionEncoding>,
+    /// The characters this server said should open a completion list on their own, out of
+    /// the same reply and written at the same moment - see
+    /// [`protocol::trigger_characters`](crate::protocol::trigger_characters). Kept because
+    /// the reply is the only time it is said, and a client that throws it away is left
+    /// guessing at one language's punctuation for every language.
+    triggers: OnceLock<Vec<char>>,
     stdin: Arc<Mutex<ChildStdin>>,
     child: Mutex<Child>,
     next_id: AtomicI64,
@@ -371,6 +377,7 @@ impl LanguageServer {
         let server = Self {
             name: spec.name,
             encoding: OnceLock::new(),
+            triggers: OnceLock::new(),
             stdin,
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
@@ -387,6 +394,9 @@ impl LanguageServer {
         )?;
         let encoding = crate::protocol::agreed_encoding(&reply)?;
         let _ = server.encoding.set(encoding);
+        let _ = server
+            .triggers
+            .set(crate::protocol::trigger_characters(&reply)?);
         server.notify("initialized", json!({}))?;
         // Readiness is counted from here rather than from the spawn: what came before is
         // the server reading the project, and what comes after is what it announces.
@@ -402,6 +412,14 @@ impl LanguageServer {
             .encoding
             .get()
             .expect("a started server has agreed an encoding")
+    }
+
+    /// The characters this server said should open a completion list on their own. Empty
+    /// for a server that named none, which is a server nothing but a word being typed asks.
+    pub fn trigger_characters(&self) -> &[char] {
+        self.triggers
+            .get()
+            .expect("a started server has read its trigger characters")
     }
 
     /// Whether the server has finished starting - see [`Readiness`] for what that means and
