@@ -49,11 +49,13 @@
 //! [`languages`] says which server serves which file, [`process`] runs one and carries the
 //! JSON-RPC, [`framing`] is the envelope that goes over its stdio, [`protocol`] is the
 //! messages - and the one place a position is converted between what an editor counts and
-//! what a server counts - and [`registry`] is what a caller talks to.
+//! what a server counts - [`edits`] puts what a rename answered with into a text, and
+//! [`registry`] is what a caller talks to.
 
 #![forbid(unsafe_code)]
 #![warn(clippy::doc_markdown)]
 
+pub mod edits;
 pub mod framing;
 pub mod languages;
 pub mod payload;
@@ -62,7 +64,9 @@ pub mod protocol;
 pub mod registry;
 
 pub use payload::{
-    LspCompletion, LspCompletionKind, LspLocation, LspPosition, LspStatus, LspWork,
+    LspCodeAction, LspCompletion, LspCompletionKind, LspDiagnostic, LspFileEdit, LspFormatting,
+    LspLocation, LspPlaces, LspPosition, LspSeverity, LspSignature, LspStatus, LspTextEdit,
+    LspWork,
 };
 pub use protocol::{AskedBecause, ClientIdentity};
 pub use registry::{LspRegistry, Workspace};

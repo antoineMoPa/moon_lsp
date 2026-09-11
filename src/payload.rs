@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// Bytes because that is what a text buffer reports and what a `String` is indexed by. The
 /// protocol counts UTF-16 code units, and converting between the two happens in one place -
 /// [`crate::protocol::lsp_character`] - rather than at every call site.
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct LspPosition {
     /// The line, counted from zero.
     pub line: usize,
@@ -32,6 +32,122 @@ pub struct LspLocation {
     pub file_path: String,
     /// The line to open it at, counted from one.
     pub line_number: usize,
+    /// What that line reads, so a list of places can be read without opening each one. `None`
+    /// for a file that could not be read - one deleted since the server last looked at it.
+    pub line_text: Option<String>,
+}
+
+/// Which places a server is asked for, about the name at one place in a file.
+///
+/// One question in the protocol's four spellings: each answers with a list of places, and a
+/// caller shows and opens those the same way whichever was asked.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspPlaces {
+    /// Where the name is defined.
+    Definition,
+    /// Where the type of the name is defined - the struct a variable holds, rather than the
+    /// line that declared the variable.
+    TypeDefinition,
+    /// Where a trait, an interface or an abstract method is implemented.
+    Implementation,
+    /// Everywhere the name is used, its declaration included.
+    References,
+}
+
+/// How a file is indented, as a server formatting it is told: the protocol's
+/// `FormattingOptions`, less the parts nobody here has an opinion on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct LspFormatting {
+    /// How many columns wide one level of indentation is.
+    pub tab_size: u32,
+    /// Whether a level is spaces rather than a tab.
+    pub insert_spaces: bool,
+}
+
+/// Something a server found wrong with a file: where, how bad, and what it says.
+///
+/// Both ends are counted the way [`LspPosition`] counts, against the text the server was last
+/// sent - see [`crate::registry::LspRegistry::diagnostics`].
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct LspDiagnostic {
+    /// Where the stretch it is about starts.
+    pub start: LspPosition,
+    /// Where it ends - the same place for a diagnostic about a point rather than a stretch.
+    pub end: LspPosition,
+    /// How bad it is.
+    pub severity: LspSeverity,
+    /// What the server says about it, which can run to several lines.
+    pub message: String,
+    /// What found it, where the server says: `rustc`, `clippy`, `rust-analyzer`, `ts`.
+    pub source: Option<String>,
+}
+
+/// How bad a diagnostic is, in the protocol's four grades.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LspSeverity {
+    /// Something that stops the code building.
+    Error,
+    /// Something that builds and is probably wrong.
+    Warning,
+    /// Something worth knowing.
+    Information,
+    /// A suggestion, often a quiet one.
+    Hint,
+}
+
+/// Something a server offers to do to the code at a place - a fix for what it found wrong
+/// there, or a rewrite - with everything it changes already worked out.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct LspCodeAction {
+    /// What the server calls it: "Insert explicit type `i32`", "Import `HashMap`".
+    pub title: String,
+    /// The protocol's kind, where the server said: `quickfix`, `refactor.extract`.
+    pub kind: Option<String>,
+    /// Whether the server says this is the fix to take, of several.
+    pub preferred: bool,
+    /// Everything it changes, one entry per file - see [`LspFileEdit`].
+    pub files: Vec<LspFileEdit>,
+}
+
+/// The signature of the call being typed, and which of its parameters the caret is at.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct LspSignature {
+    /// The whole signature, as the server writes it: `fn add(a: u32, b: u32) -> u32`.
+    pub label: String,
+    /// Where in `label` the parameter being typed is, in bytes. `None` for a signature with no
+    /// parameters, or one the server did not say the caret is at.
+    pub active_parameter: Option<std::ops::Range<usize>>,
+    /// What the server says about the function, where it says anything.
+    pub documentation: Option<String>,
+}
+
+/// One stretch of a file to replace with other text: part of what a rename or a format
+/// changes.
+///
+/// Both ends are counted the way [`LspPosition`] counts, in bytes into their line, and are
+/// places in the text as the server had it when it answered - see [`crate::edits`], which is
+/// what turns them into ranges of that text and refuses them against any other.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct LspTextEdit {
+    /// Where the text to replace starts.
+    pub start: LspPosition,
+    /// Where it ends, which is where it starts for text that is only put in.
+    pub end: LspPosition,
+    /// What goes in its place.
+    pub new_text: String,
+}
+
+/// Everything one answer changes in one file.
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct LspFileEdit {
+    /// The file, relative to the repo. Always inside it: an answer that would change a file
+    /// outside the repo is refused whole rather than handed back - see
+    /// [`crate::protocol::file_edits_from`].
+    pub file_path: String,
+    /// The stretches to replace, in the order they sit in the file and never overlapping.
+    pub edits: Vec<LspTextEdit>,
 }
 
 /// One thing a server offered to complete with.

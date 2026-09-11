@@ -2,8 +2,8 @@
 //!
 //! A server is started per workspace and per language, and lives as long as the caller
 //! keeps the registry. Everything a caller needs is here: whether a file has a server
-//! behind it, what those servers are doing, the document notifications, and the two
-//! questions - where a name is defined, and what could be typed next.
+//! behind it, what those servers are doing, the document notifications, and the questions -
+//! where a name is defined, what could be typed next, and what renaming a name would change.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -11,11 +11,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     languages::{self, ExtensionSpec, ServerSpec},
-    payload::{LspCompletion, LspLocation, LspPosition, LspStatus, LspWork},
+    payload::{LspCompletion, LspFileEdit, LspLocation, LspPosition, LspStatus, LspWork},
     process::{LanguageServer, PositionEncoding},
     protocol::{self, AskedBecause, ClientIdentity},
 };
@@ -332,14 +332,42 @@ impl LspRegistry {
         file_path: &str,
         at: LspPosition,
     ) -> Result<Vec<LspLocation>> {
+        self.places(
+            workspace,
+            file_path,
+            at,
+            crate::payload::LspPlaces::Definition,
+        )
+    }
+
+    /// The places of one kind the server names for the name at this place: where it is
+    /// defined, where its type is, where it is implemented, or everywhere it is used. Empty
+    /// when the server has no answer, and for a file no server serves.
+    ///
+    /// Each place carries what its line reads, off the copy the server was sent for a file
+    /// open in it and off the disk for any other - see [`protocol::locations_from`].
+    pub fn places(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        at: LspPosition,
+        which: crate::payload::LspPlaces,
+    ) -> Result<Vec<LspLocation>> {
         let Some(question) = self.ask(workspace, file_path, &at)? else {
             return Ok(Vec::new());
         };
         let answer = question.server.request(
-            "textDocument/definition",
-            protocol::position_params(&question.uri, at.line, question.character),
+            protocol::places_method(which),
+            protocol::places_params(&question.uri, at.line, question.character, which),
         )?;
-        protocol::locations_from(answer, workspace.root)
+        let server = &question.server;
+        protocol::locations_from(answer, workspace.root, |path| {
+            let open = path
+                .strip_prefix(workspace.root)
+                .ok()
+                .and_then(|in_repo| server.document_text(&in_repo.display().to_string()));
+            open.or_else(|| std::fs::read_to_string(path).ok())
+        })
     }
 
     /// What could be typed at this place. Empty when the server offers nothing.
@@ -369,6 +397,218 @@ impl LspRegistry {
             ),
         )?;
         protocol::completions_from(answer)
+    }
+
+    /// What the name at this place is called, as the server would rename it: the text a
+    /// caller offers to be typed over. `None` when the server says nothing at this place can
+    /// be renamed, and for a file no server serves.
+    ///
+    /// Asked before [`LspRegistry::rename`] rather than folded into it, so a caret on a
+    /// keyword or a string is told so before anybody types a new name for it.
+    pub fn prepare_rename(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        at: LspPosition,
+    ) -> Result<Option<String>> {
+        let Some(question) = self.ask(workspace, file_path, &at)? else {
+            return Ok(None);
+        };
+        let answer = question.server.request(
+            "textDocument/prepareRename",
+            protocol::position_params(&question.uri, at.line, question.character),
+        )?;
+        protocol::renamable_name(answer, &question.text, question.server.encoding())
+    }
+
+    /// Everything that calling the name at this place `new_name` changes, file by file,
+    /// every place already in the editor's units. Empty for a file no server serves.
+    ///
+    /// Nothing is written: what to do with the edits - put them into an open buffer, write a
+    /// file nobody has open - is the caller's, since only the caller knows which is which.
+    /// The places are worked out against the text the server had for each file, which is the
+    /// copy it was sent for a file open in it and the file on disk for one that is not.
+    pub fn rename(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        at: LspPosition,
+        new_name: &str,
+    ) -> Result<Vec<LspFileEdit>> {
+        let Some(question) = self.ask(workspace, file_path, &at)? else {
+            return Ok(Vec::new());
+        };
+        let answer = question.server.request(
+            "textDocument/rename",
+            protocol::rename_params(&question.uri, at.line, question.character, new_name),
+        )?;
+        let server = &question.server;
+        protocol::file_edits_from(
+            answer,
+            workspace.root,
+            server.encoding(),
+            |path| match server.document_text(path) {
+                Some(text) => Ok(text),
+                None => std::fs::read_to_string(workspace.root.join(path))
+                    .with_context(|| format!("could not read {path}, which the rename would edit")),
+            },
+        )
+    }
+
+    /// The edits that format a whole file, indented the way `options` says, counted against the
+    /// text this side last told the server the file holds. Empty for a file already formatted.
+    ///
+    /// Refused, rather than answered with nothing, for a file no server serves and for one
+    /// whose server never said it formats: nothing to change and nobody to ask are different
+    /// answers, and "already formatted" would be a lie about the second.
+    pub fn format(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        options: crate::payload::LspFormatting,
+    ) -> Result<Vec<crate::payload::LspTextEdit>> {
+        let Some(language) = self.served_language(file_path) else {
+            bail!("no language server serves {file_path}");
+        };
+        let key = (workspace.key.to_string(), language.server.name);
+        let server = self.running(&key).ok_or_else(|| {
+            anyhow!(
+                "no {} server is running for this workspace",
+                language.server.name
+            )
+        })?;
+        if !server.formats() {
+            bail!("the {} server does not format files", language.server.name);
+        }
+        let Some(text) = server.document_text(file_path) else {
+            bail!(
+                "{file_path} is not open in the {} server",
+                language.server.name
+            );
+        };
+        let uri = protocol::file_uri(&workspace.root.join(file_path));
+        let answer = server.request(
+            "textDocument/formatting",
+            protocol::formatting_params(&uri, options),
+        )?;
+        protocol::text_edits_from(answer, &text, server.encoding())
+    }
+
+    /// What the server says about the name at this place - its type, its signature, its docs -
+    /// as markdown. `None` for nothing to say, and for a file no server serves.
+    pub fn hover(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        at: LspPosition,
+    ) -> Result<Option<String>> {
+        let Some(question) = self.ask(workspace, file_path, &at)? else {
+            return Ok(None);
+        };
+        let answer = question.server.request(
+            "textDocument/hover",
+            protocol::position_params(&question.uri, at.line, question.character),
+        )?;
+        protocol::hover_markdown_from(answer)
+    }
+
+    /// What the server last said is wrong with a file open in it, every place counted against
+    /// the text it was last sent. Empty for a file no server serves, one not open, and one the
+    /// server has said nothing about.
+    ///
+    /// A read of what has already been published rather than a question: servers push these
+    /// when they like - rust-analyzer as it reads, and again after every `cargo check` - and
+    /// they are kept as they arrive, so asking costs nothing but a lock.
+    pub fn diagnostics(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+    ) -> Vec<crate::payload::LspDiagnostic> {
+        let Some(language) = self.served_language(file_path) else {
+            return Vec::new();
+        };
+        let key = (workspace.key.to_string(), language.server.name);
+        let Some(server) = self.running(&key) else {
+            return Vec::new();
+        };
+        let Some(text) = server.document_text(file_path) else {
+            return Vec::new();
+        };
+        let published = server.diagnostics_of(&workspace.root.join(file_path));
+        protocol::diagnostics_from(&published, &text, server.encoding())
+    }
+
+    /// Tell the server a file open in it was written to disk - which is what rust-analyzer runs
+    /// `cargo check` on, and so where most of what it finds wrong comes from. A file no server
+    /// serves, or one not open, is quietly nothing to do.
+    pub fn did_save(&self, workspace: &Workspace<'_>, file_path: &str) -> Result<()> {
+        let Some(language) = self.served_language(file_path) else {
+            return Ok(());
+        };
+        let key = (workspace.key.to_string(), language.server.name);
+        let Some(server) = self.running(&key) else {
+            return Ok(());
+        };
+        if !server.has_document(file_path) {
+            return Ok(());
+        }
+        let uri = protocol::file_uri(&workspace.root.join(file_path));
+        server.notify("textDocument/didSave", protocol::did_close_params(&uri))
+    }
+
+    /// What the server offers to do to the code at this place - the fixes for what it found
+    /// wrong there, and the rewrites it has for it - each with everything it changes worked
+    /// out, in the editor's units. Empty for nothing on offer, and for a file no server serves.
+    ///
+    /// The diagnostics the server published about this place go with the question, which is
+    /// what its fixes are offered for.
+    pub fn code_actions(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        at: LspPosition,
+    ) -> Result<Vec<crate::payload::LspCodeAction>> {
+        let Some(question) = self.ask(workspace, file_path, &at)? else {
+            return Ok(Vec::new());
+        };
+        let server = &question.server;
+        let here = protocol::diagnostics_at(
+            &server.diagnostics_of(&workspace.root.join(file_path)),
+            at.line,
+            question.character,
+        );
+        let answer = server.request(
+            "textDocument/codeAction",
+            protocol::code_action_params(&question.uri, at.line, question.character, &here),
+        )?;
+        protocol::code_actions_from(
+            answer,
+            workspace.root,
+            server.encoding(),
+            |path| match server.document_text(path) {
+                Some(text) => Ok(text),
+                None => std::fs::read_to_string(workspace.root.join(path))
+                    .with_context(|| format!("could not read {path}, which the action would edit")),
+            },
+        )
+    }
+
+    /// The signature of the call around this place, and which parameter it is at. `None`
+    /// when no call is around it, and for a file no server serves.
+    pub fn signature_help(
+        &self,
+        workspace: &Workspace<'_>,
+        file_path: &str,
+        at: LspPosition,
+    ) -> Result<Option<crate::payload::LspSignature>> {
+        let Some(question) = self.ask(workspace, file_path, &at)? else {
+            return Ok(None);
+        };
+        let answer = question.server.request(
+            "textDocument/signatureHelp",
+            protocol::position_params(&question.uri, at.line, question.character),
+        )?;
+        protocol::signature_from(answer)
     }
 
     /// Work out what a question about one place in one file needs.
@@ -407,6 +647,7 @@ impl LspRegistry {
             uri,
             character,
             typed,
+            text,
         }))
     }
 }
@@ -416,6 +657,9 @@ impl LspRegistry {
 struct Question {
     server: Arc<LanguageServer>,
     uri: String,
+    /// The text this side last told the server the file holds, which is what any place the
+    /// server names in its answer is counted against.
+    text: String,
     /// The column, already converted - see [`protocol::lsp_character`].
     character: u32,
     /// The character the position sits behind, off the text this side last told the server

@@ -291,6 +291,10 @@ pub(crate) fn refusal_from(error: &Value) -> Refusal {
 /// The requests waiting for their answers, by the id they went out with.
 type Pending = Arc<Mutex<HashMap<i64, mpsc::Sender<Result<Value, Refusal>>>>>;
 
+/// What a server has published about each file, shared between the thread reading its
+/// notifications and whoever asks.
+type Diagnostics = Arc<Mutex<HashMap<std::path::PathBuf, Vec<lsp_types::Diagnostic>>>>;
+
 /// One running language server, and everything asked of it.
 ///
 /// Held behind an `Arc` and spoken to from several threads: the reader thread carries its
@@ -307,6 +311,14 @@ pub struct LanguageServer {
     /// the reply is the only time it is said, and a client that throws it away is left
     /// guessing at one language's punctuation for every language.
     triggers: OnceLock<Vec<char>>,
+    /// Whether the server said it formats whole files, out of the same reply - see
+    /// [`protocol::formats`](crate::protocol::formats).
+    formats: OnceLock<bool>,
+    /// What the server last published about each file, by its path on disk - see
+    /// [`protocol::published_diagnostics`](crate::protocol::published_diagnostics). Kept in the
+    /// server's own units: they are turned into the editor's against the text each is about,
+    /// which is only known when somebody asks.
+    diagnostics: Diagnostics,
     stdin: Arc<Mutex<ChildStdin>>,
     child: Mutex<Child>,
     next_id: AtomicI64,
@@ -359,11 +371,13 @@ impl LanguageServer {
         let readiness = Arc::new(Mutex::new(Readiness::new()));
         let working: Arc<Mutex<Option<Working>>> = Arc::new(Mutex::new(None));
 
+        let diagnostics: Diagnostics = Arc::new(Mutex::new(HashMap::new()));
         read_messages(
             stdout,
             Arc::clone(&pending),
             Arc::clone(&readiness),
             Arc::clone(&working),
+            Arc::clone(&diagnostics),
             Arc::clone(&stdin),
         );
         // Nothing reads a server's diagnostics prose, but a full stderr pipe would stop the
@@ -378,6 +392,8 @@ impl LanguageServer {
             name: spec.name,
             encoding: OnceLock::new(),
             triggers: OnceLock::new(),
+            formats: OnceLock::new(),
+            diagnostics,
             stdin,
             child: Mutex::new(child),
             next_id: AtomicI64::new(1),
@@ -397,6 +413,7 @@ impl LanguageServer {
         let _ = server
             .triggers
             .set(crate::protocol::trigger_characters(&reply)?);
+        let _ = server.formats.set(crate::protocol::formats(&reply)?);
         server.notify("initialized", json!({}))?;
         // Readiness is counted from here rather than from the spawn: what came before is
         // the server reading the project, and what comes after is what it announces.
@@ -420,6 +437,25 @@ impl LanguageServer {
         self.triggers
             .get()
             .expect("a started server has read its trigger characters")
+    }
+
+    /// What the server last published about one file, in its own units. Empty for a file it
+    /// has said nothing about, and for one it last said has nothing wrong with it.
+    pub fn diagnostics_of(&self, path: &std::path::Path) -> Vec<lsp_types::Diagnostic> {
+        self.diagnostics
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Whether this server said it formats whole files.
+    pub fn formats(&self) -> bool {
+        *self
+            .formats
+            .get()
+            .expect("a started server has said whether it formats")
     }
 
     /// Whether the server has finished starting - see [`Readiness`] for what that means and
@@ -575,6 +611,7 @@ fn read_messages(
     pending: Pending,
     readiness: Arc<Mutex<Readiness>>,
     working: Arc<Mutex<Option<Working>>>,
+    diagnostics: Diagnostics,
     stdin: Arc<Mutex<ChildStdin>>,
 ) {
     std::thread::spawn(move || {
@@ -590,7 +627,14 @@ fn read_messages(
                 let Ok(message) = serde_json::from_str::<Value>(&message) else {
                     continue;
                 };
-                handle_message(&message, &pending, &readiness, &working, &stdin);
+                handle_message(
+                    &message,
+                    &pending,
+                    &readiness,
+                    &working,
+                    &diagnostics,
+                    &stdin,
+                );
             }
         }
 
@@ -610,6 +654,7 @@ fn handle_message(
     pending: &Pending,
     readiness: &Mutex<Readiness>,
     working: &Mutex<Option<Working>>,
+    diagnostics: &Mutex<HashMap<std::path::PathBuf, Vec<lsp_types::Diagnostic>>>,
     stdin: &Mutex<ChildStdin>,
 ) {
     let method = message.get("method").and_then(Value::as_str);
@@ -636,7 +681,14 @@ fn handle_message(
                 crate::protocol::progress_note(message),
             );
         }
-        // Any other notification - diagnostics, log messages - is not this client's business.
+        // What the server found wrong with a file, all of it each time: an empty list is the
+        // file having nothing wrong with it any more.
+        (Some("textDocument/publishDiagnostics"), None) => {
+            if let Some((path, published)) = crate::protocol::published_diagnostics(message) {
+                diagnostics.lock().unwrap().insert(path, published);
+            }
+        }
+        // Any other notification - log messages, telemetry - is not this client's business.
         (Some(_), None) => {}
         // An answer to something we asked.
         (None, Some(id)) => {

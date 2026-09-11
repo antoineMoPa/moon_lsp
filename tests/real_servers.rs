@@ -13,7 +13,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use moon_lsp::{LspPosition, LspRegistry, LspStatus, Workspace, languages, process::PositionEncoding};
+use moon_lsp::{
+    LspPosition, LspRegistry, LspStatus, Workspace, languages, process::PositionEncoding,
+};
 
 /// What the servers are held under. Only one workspace is open at a time here, so the key
 /// says what it is rather than distinguishing anything.
@@ -153,7 +155,10 @@ fn a_real_rust_server_stays_ready_while_it_goes_on_checking_the_project() {
             );
             std::thread::sleep(Duration::from_millis(250));
         }
-        println!("edit {edit}: still ready, working: {:?}", working_titles(&servers));
+        println!(
+            "edit {edit}: still ready, working: {:?}",
+            working_titles(&servers)
+        );
     }
 
     // And it is not only saying it is ready: the question it was refusing to be asked is
@@ -175,11 +180,7 @@ fn a_real_rust_server_stays_ready_while_it_goes_on_checking_the_project() {
         .expect("expected the call on that line")
         + 1;
     let locations = servers
-        .definition(
-            &repo,
-            file_path,
-            LspPosition { line, column },
-        )
+        .definition(&repo, file_path, LspPosition { line, column })
         .expect("failed to ask where content_length is defined");
     println!(
         "definition: {:?}",
@@ -348,6 +349,120 @@ fn a_utf8_server_resolves_a_position_with_accents_to_the_left_of_it() {
     assert_eq!(
         locations[0].line_number, 1,
         "café_size is defined on the first line"
+    );
+
+    servers
+        .did_close(&repo, "src/lib.rs")
+        .expect("failed to close the document");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A rename across two files of a real crate: the name asked about first, then everywhere it
+/// is used, with every place already in bytes so the edits go straight into the texts.
+///
+/// `#[ignore]`d like the rest of this file. Run it with
+/// `cargo test --test real_servers -- --ignored --nocapture a_real_rust_server_renames`.
+#[test]
+#[ignore]
+fn a_real_rust_server_renames_a_name_across_the_files_that_use_it() {
+    let root = fixture_root("rust-rename");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"lsp-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("failed to write the fixture manifest");
+    std::fs::create_dir_all(root.join("src")).expect("failed to create the fixture source folder");
+    let lib = "pub fn café() -> u32 {\n    1\n}\n\nmod other;\n";
+    let other = "pub fn twice() -> u32 {\n    let ñ = 2; crate::café() * ñ\n}\n";
+    std::fs::write(root.join("src/lib.rs"), lib).expect("failed to write lib.rs");
+    std::fs::write(root.join("src/other.rs"), other).expect("failed to write other.rs");
+
+    let servers = registry();
+    let repo = Workspace {
+        key: WORKSPACE,
+        root: &root,
+    };
+    servers
+        .did_open(&repo, "src/lib.rs", lib)
+        .expect("failed to open the document");
+    wait_until_ready(&servers, "src/lib.rs", Duration::from_secs(300));
+
+    let at = LspPosition { line: 0, column: 8 };
+    assert_eq!(
+        servers
+            .prepare_rename(&repo, "src/lib.rs", at)
+            .expect("failed to ask what is at the caret"),
+        Some("café".to_string())
+    );
+
+    let files = servers
+        .rename(&repo, "src/lib.rs", at, "tea")
+        .expect("failed to rename");
+    println!(
+        "rename: {:?}",
+        files
+            .iter()
+            .map(|file| (&file.file_path, file.edits.len()))
+            .collect::<Vec<_>>()
+    );
+    let edited = |file_path: &str, text: &str| {
+        let file = files
+            .iter()
+            .find(|file| file.file_path == file_path)
+            .unwrap_or_else(|| panic!("expected {file_path} to be edited"));
+        moon_lsp::edits::apply(text, &file.edits).expect("expected the edits to fit")
+    };
+    assert_eq!(edited("src/lib.rs", lib), lib.replace("café", "tea"));
+    // Not open in the server, so its places were counted against the file on disk - with an
+    // `ñ` ahead of the call to prove the columns came back as bytes.
+    assert_eq!(edited("src/other.rs", other), other.replace("café", "tea"));
+
+    servers
+        .did_close(&repo, "src/lib.rs")
+        .expect("failed to close the document");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// rustfmt, through rust-analyzer: a badly laid-out file comes back as rustfmt lays it out.
+///
+/// `#[ignore]`d like the rest of this file. Run it with
+/// `cargo test --test real_servers -- --ignored --nocapture a_real_rust_server_formats`.
+#[test]
+#[ignore]
+fn a_real_rust_server_formats_a_file() {
+    let root = fixture_root("rust-format");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"lsp-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .expect("failed to write the fixture manifest");
+    std::fs::create_dir_all(root.join("src")).expect("failed to create the fixture source folder");
+    let lib = "pub fn   café( )->u32{1}\n";
+    std::fs::write(root.join("src/lib.rs"), lib).expect("failed to write lib.rs");
+
+    let servers = registry();
+    let repo = Workspace {
+        key: WORKSPACE,
+        root: &root,
+    };
+    servers
+        .did_open(&repo, "src/lib.rs", lib)
+        .expect("failed to open the document");
+    wait_until_ready(&servers, "src/lib.rs", Duration::from_secs(300));
+
+    let edits = servers
+        .format(
+            &repo,
+            "src/lib.rs",
+            moon_lsp::LspFormatting {
+                tab_size: 4,
+                insert_spaces: true,
+            },
+        )
+        .expect("failed to format");
+    assert_eq!(
+        moon_lsp::edits::apply(lib, &edits).expect("expected the edits to fit"),
+        "pub fn café() -> u32 {\n    1\n}\n"
     );
 
     servers

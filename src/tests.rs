@@ -50,7 +50,10 @@ fn a_server_that_keeps_checking_the_project_after_it_has_started_becomes_and_sta
         "the cache is still being primed, which is the server starting up"
     );
 
-    readiness.follow(&progress("rustAnalyzer/cachePriming", json!({ "kind": "end" })));
+    readiness.follow(&progress(
+        "rustAnalyzer/cachePriming",
+        json!({ "kind": "end" }),
+    ));
     readiness.rewind(SETTLING);
     assert!(
         readiness.is_ready(),
@@ -119,7 +122,10 @@ fn a_server_announcing_its_startup_work_in_a_row_is_not_ready_in_the_gap_between
 fn work_a_server_begins_after_it_has_started_never_puts_it_back_to_starting() {
     let mut readiness = Readiness::new();
     readiness.rewind(SETTLING);
-    assert!(readiness.is_ready(), "a server that announced nothing at all");
+    assert!(
+        readiness.is_ready(),
+        "a server that announced nothing at all"
+    );
 
     readiness.follow(&progress(
         "some/unfamiliar/work",
@@ -358,9 +364,7 @@ fn a_piece_of_work_that_reports_no_percentage_still_says_what_it_is_doing() {
 /// against the work already in hand rather than on their own.
 #[test]
 fn a_report_keeps_the_title_its_begin_gave_it_and_an_end_leaves_the_server_doing_nothing() {
-    let notification = |value: serde_json::Value| {
-        json!({ "jsonrpc": "2.0", "method": "$/progress", "params": { "token": "t", "value": value } })
-    };
+    let notification = |value: serde_json::Value| json!({ "jsonrpc": "2.0", "method": "$/progress", "params": { "token": "t", "value": value } });
     let mut working: Option<Working> = None;
 
     let begun = notification(json!({ "kind": "begin", "title": "Indexing", "percentage": 0 }));
@@ -516,8 +520,8 @@ fn a_definition_is_read_as_a_repo_path_and_a_line_counted_from_one() {
         },
     });
 
-    let locations =
-        protocol::locations_from(answer, repo_root).expect("expected a readable definition");
+    let locations = protocol::locations_from(answer, repo_root, |_| None)
+        .expect("expected a readable definition");
     assert_eq!(locations.len(), 1);
     assert_eq!(locations[0].file_path, "src/main.rs");
     assert_eq!(
@@ -535,8 +539,9 @@ fn a_definition_outside_the_repo_keeps_the_path_that_names_it() {
             "end": { "line": 0, "character": 1 },
         },
     }]);
-    let locations = protocol::locations_from(answer, std::path::Path::new("/home/dev/repo"))
-        .expect("expected a readable definition");
+    let locations =
+        protocol::locations_from(answer, std::path::Path::new("/home/dev/repo"), |_| None)
+            .expect("expected a readable definition");
     assert_eq!(
         locations[0].file_path,
         "/home/dev/.cargo/registry/serde/lib.rs"
@@ -560,8 +565,7 @@ fn a_completion_keeps_the_kind_the_server_gave_it_and_none_where_it_gave_none() 
     ]);
 
     let completions = protocol::completions_from(answer).expect("expected a readable list");
-    let kinds: Vec<Option<LspCompletionKind>> =
-        completions.iter().map(|item| item.kind).collect();
+    let kinds: Vec<Option<LspCompletionKind>> = completions.iter().map(|item| item.kind).collect();
     assert_eq!(
         kinds,
         [
@@ -622,11 +626,15 @@ fn a_server_is_told_it_is_talking_to_this_crate_when_the_caller_says_nothing() {
         &crate::ClientIdentity::default(),
     );
     assert_eq!(
-        params.pointer("/clientInfo/name").and_then(|it| it.as_str()),
+        params
+            .pointer("/clientInfo/name")
+            .and_then(|it| it.as_str()),
         Some("moon_lsp")
     );
     assert_eq!(
-        params.pointer("/clientInfo/version").and_then(|it| it.as_str()),
+        params
+            .pointer("/clientInfo/version")
+            .and_then(|it| it.as_str()),
         Some(env!("CARGO_PKG_VERSION")),
         "a version is worth sending: it is what tells one bug report from another"
     );
@@ -641,7 +649,9 @@ fn a_caller_that_says_who_it_is_has_its_own_name_and_version_sent() {
         &crate::ClientIdentity::new("moonreview", "0.20.0"),
     );
     assert_eq!(
-        params.pointer("/clientInfo").expect("expected a clientInfo"),
+        params
+            .pointer("/clientInfo")
+            .expect("expected a clientInfo"),
         &json!({ "name": "moonreview", "version": "0.20.0" })
     );
 
@@ -653,7 +663,9 @@ fn a_caller_that_says_who_it_is_has_its_own_name_and_version_sent() {
         },
     );
     assert_eq!(
-        versionless.pointer("/clientInfo").expect("expected a clientInfo"),
+        versionless
+            .pointer("/clientInfo")
+            .expect("expected a clientInfo"),
         &json!({ "name": "a script" })
     );
 }
@@ -738,7 +750,9 @@ fn a_completion_asked_after_a_trigger_says_which_one_and_one_asked_while_typing_
     );
     // And it is still a question about the same place, in the server's own units.
     assert_eq!(
-        after_a_dot.pointer("/position").expect("expected a position"),
+        after_a_dot
+            .pointer("/position")
+            .expect("expected a position"),
         &json!({ "line": 4, "character": 18 })
     );
 
@@ -749,7 +763,9 @@ fn a_completion_asked_after_a_trigger_says_which_one_and_one_asked_while_typing_
         protocol::AskedBecause::SomebodyIsTyping,
     );
     assert_eq!(
-        while_typing.pointer("/context").expect("expected a context"),
+        while_typing
+            .pointer("/context")
+            .expect("expected a context"),
         &json!({ "triggerKind": 1 })
     );
 
@@ -781,4 +797,427 @@ fn the_character_a_caret_sits_behind_is_read_off_the_text_this_side_holds() {
     // to it and answers with what is before it.
     assert_eq!(behind(1, "let café".len()), Some('é'));
     assert_eq!(behind(1, "let caf".len() + 1), Some('f'));
+}
+
+/// The way back from a server's column to the editor's bytes, which every place a rename names
+/// goes through: an accent is two bytes and one UTF-16 unit, an emoji four bytes and two.
+#[test]
+fn a_column_a_server_names_is_turned_back_into_bytes_against_its_line() {
+    let line = "let café = \"😀\"; café";
+    let utf16 = |byte_column: usize| line[..byte_column].encode_utf16().count() as u32;
+    let second = line.rfind("café").expect("the second café");
+
+    assert_eq!(
+        protocol::byte_column(line, utf16(second), PositionEncoding::Utf16),
+        second
+    );
+    assert_eq!(
+        protocol::byte_column(line, second as u32, PositionEncoding::Utf8),
+        second
+    );
+    // Between the two halves of the emoji is the emoji, and past the end is the end.
+    let emoji = line.find('😀').expect("the emoji");
+    assert_eq!(
+        protocol::byte_column(line, utf16(emoji) + 1, PositionEncoding::Utf16),
+        emoji
+    );
+    assert_eq!(
+        protocol::byte_column(line, 400, PositionEncoding::Utf16),
+        line.len()
+    );
+}
+
+/// A server answers a prepareRename with the range of the name or with the text to offer, and
+/// nothing at all where there is nothing to rename.
+#[test]
+fn what_a_server_would_rename_is_read_off_the_range_it_names_or_the_text_it_offers() {
+    let text = "fn main() {}\nlet héllo = greet();\n";
+    let range =
+        json!({ "start": { "line": 1, "character": 12 }, "end": { "line": 1, "character": 17 } });
+
+    assert_eq!(
+        protocol::renamable_name(range, text, PositionEncoding::Utf16)
+            .expect("expected a range to be read"),
+        Some("greet".to_string())
+    );
+    let offered = json!({
+        "range": { "start": { "line": 1, "character": 12 }, "end": { "line": 1, "character": 17 } },
+        "placeholder": "greet",
+    });
+    assert_eq!(
+        protocol::renamable_name(offered, text, PositionEncoding::Utf16)
+            .expect("expected a placeholder to be read"),
+        Some("greet".to_string())
+    );
+    assert_eq!(
+        protocol::renamable_name(serde_json::Value::Null, text, PositionEncoding::Utf16)
+            .expect("expected nothing to be read as nothing"),
+        None
+    );
+    // Never asked for, so a server sending it is refused rather than guessed at.
+    assert!(
+        protocol::renamable_name(
+            json!({ "defaultBehavior": true }),
+            text,
+            PositionEncoding::Utf16
+        )
+        .is_err()
+    );
+}
+
+/// A rename's answer is one entry per file, relative to the repo, every place in bytes - and a
+/// file the answer names twice is one entry.
+#[test]
+fn a_rename_answer_is_one_entry_per_file_with_every_place_in_bytes() {
+    let root = std::path::Path::new("/home/dev/repo");
+    let texts = |file_path: &str| -> anyhow::Result<String> {
+        Ok(match file_path {
+            "src/lib.rs" => "pub fn greet() {}\n".to_string(),
+            "src/main.rs" => "fn main() { let é = lib::greet(); }\n".to_string(),
+            other => anyhow::bail!("asked for {other}"),
+        })
+    };
+    let edit = |line: u32, start: u32, end: u32| json!({ "range": { "start": { "line": line, "character": start }, "end": { "line": line, "character": end } }, "newText": "hello" });
+    let answer = json!({
+        "documentChanges": [
+            { "textDocument": { "uri": "file:///home/dev/repo/src/main.rs", "version": 2 }, "edits": [edit(0, 25, 30)] },
+            { "textDocument": { "uri": "file:///home/dev/repo/src/lib.rs", "version": null }, "edits": [edit(0, 7, 12)] },
+        ]
+    });
+
+    let files = protocol::file_edits_from(answer, root, PositionEncoding::Utf16, texts)
+        .expect("expected the answer to be read");
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.file_path.as_str())
+            .collect::<Vec<_>>(),
+        ["src/main.rs", "src/lib.rs"]
+    );
+    // The `é` to the left of the call is one UTF-16 unit and two bytes.
+    assert_eq!(
+        files[0].edits[0].start,
+        LspPosition {
+            line: 0,
+            column: 26
+        }
+    );
+    assert_eq!(
+        crate::edits::apply(&texts("src/main.rs").unwrap(), &files[0].edits)
+            .expect("expected the edit to fit the text it was worked out against"),
+        "fn main() { let é = lib::hello(); }\n"
+    );
+
+    // The older shape of the same answer reads the same, in the order of the files' names.
+    let changes = json!({ "changes": {
+        "file:///home/dev/repo/src/main.rs": [edit(0, 25, 30)],
+        "file:///home/dev/repo/src/lib.rs": [edit(0, 7, 12)],
+    }});
+    let files = protocol::file_edits_from(changes, root, PositionEncoding::Utf16, texts)
+        .expect("expected the older shape to be read");
+    assert_eq!(files[0].file_path, "src/lib.rs");
+    assert_eq!(
+        files[1].edits[0].start,
+        LspPosition {
+            line: 0,
+            column: 26
+        }
+    );
+}
+
+/// A rename that would write outside the repo, or create, rename or delete a file, is refused
+/// whole rather than carried out in part.
+#[test]
+fn a_rename_outside_the_repo_or_that_moves_files_is_refused_whole() {
+    let root = std::path::Path::new("/home/dev/repo");
+    let text = |_: &str| -> anyhow::Result<String> { Ok("pub fn greet() {}\n".to_string()) };
+    let edit = json!({ "range": { "start": { "line": 0, "character": 7 }, "end": { "line": 0, "character": 12 } }, "newText": "hello" });
+
+    let outside = json!({ "changes": {
+        "file:///home/dev/repo/src/lib.rs": [edit.clone()],
+        "file:///home/dev/.cargo/registry/src/dep/lib.rs": [edit.clone()],
+    }});
+    let refused = protocol::file_edits_from(outside, root, PositionEncoding::Utf16, text)
+        .err()
+        .expect("an edit outside the repo has to be refused");
+    assert!(
+        refused.to_string().contains("outside the repo"),
+        "{refused}"
+    );
+
+    let moves_a_file = json!({ "documentChanges": [
+        { "kind": "rename", "oldUri": "file:///home/dev/repo/src/a.rs", "newUri": "file:///home/dev/repo/src/b.rs" },
+        { "textDocument": { "uri": "file:///home/dev/repo/src/lib.rs", "version": 1 }, "edits": [edit] },
+    ]});
+    assert!(
+        protocol::file_edits_from(moves_a_file, root, PositionEncoding::Utf16, text).is_err(),
+        "a file operation this client never offered has to be refused"
+    );
+}
+
+/// Edits go in against the text they were worked out against, all of them or none: one that
+/// does not fit the text, or two that overlap, refuse the lot.
+#[test]
+fn edits_go_in_together_or_not_at_all() {
+    let at = |line, column| LspPosition { line, column };
+    let edit = |start, end, new_text: &str| crate::payload::LspTextEdit {
+        start,
+        end,
+        new_text: new_text.to_string(),
+    };
+    let text = "greet();\ngreet();\n";
+
+    // Handed in back to front, and put in as though they were not.
+    assert_eq!(
+        crate::edits::apply(
+            text,
+            &[
+                edit(at(1, 0), at(1, 5), "hello"),
+                edit(at(0, 0), at(0, 5), "hi")
+            ]
+        )
+        .expect("expected both edits to fit"),
+        "hi();\nhello();\n"
+    );
+    assert!(
+        crate::edits::apply(text, &[edit(at(0, 0), at(0, 40), "x")]).is_err(),
+        "a column past the end of its line is an edit for another text"
+    );
+    assert!(
+        crate::edits::apply(text, &[edit(at(5, 0), at(5, 1), "x")]).is_err(),
+        "a line past the end is an edit for another text"
+    );
+    assert!(
+        crate::edits::apply(
+            text,
+            &[edit(at(0, 0), at(0, 4), "a"), edit(at(0, 2), at(0, 6), "b")]
+        )
+        .is_err(),
+        "two edits over the same text have no order that keeps both meaning what they meant"
+    );
+}
+
+/// A list of places carries what each of its lines reads, each file read once however many of
+/// its lines are named - and a file that cannot be read keeps its place, without its line.
+#[test]
+fn places_carry_what_their_line_reads_off_each_file_read_once() {
+    let place = |file: &str, line: u32| {
+        json!({ "uri": format!("file:///home/dev/repo/{file}"), "range": {
+            "start": { "line": line, "character": 0 }, "end": { "line": line, "character": 1 } } })
+    };
+    let answer = json!([
+        place("src/lib.rs", 0),
+        place("src/lib.rs", 2),
+        place("src/gone.rs", 0)
+    ]);
+    let reads = std::cell::Cell::new(0);
+    let locations =
+        protocol::locations_from(answer, std::path::Path::new("/home/dev/repo"), |path| {
+            reads.set(reads.get() + 1);
+            path.ends_with("src/lib.rs")
+                .then(|| "pub fn greet() {}\n\nfn main() { greet(); }\n".to_string())
+        })
+        .expect("expected the places to be read");
+
+    assert_eq!(
+        locations
+            .iter()
+            .map(|location| location.line_text.as_deref())
+            .collect::<Vec<_>>(),
+        [
+            Some("pub fn greet() {}"),
+            Some("fn main() { greet(); }"),
+            None
+        ]
+    );
+    assert_eq!(reads.get(), 2, "each file is read once");
+}
+
+/// The four kinds of place are four methods, and only references say anything more than the
+/// position: that the declaration is wanted among them.
+#[test]
+fn each_kind_of_place_is_its_own_request_and_references_include_the_declaration() {
+    use crate::payload::LspPlaces;
+
+    assert_eq!(
+        protocol::places_method(LspPlaces::TypeDefinition),
+        "textDocument/typeDefinition"
+    );
+    assert_eq!(
+        protocol::places_method(LspPlaces::References),
+        "textDocument/references"
+    );
+    let references = protocol::places_params("file:///repo/a.rs", 0, 7, LspPlaces::References);
+    assert_eq!(references["context"]["includeDeclaration"], json!(true));
+    let definition = protocol::places_params("file:///repo/a.rs", 0, 7, LspPlaces::Definition);
+    assert!(definition.get("context").is_none());
+}
+
+/// Whether a server formats is read off its reply in all three shapes it can say it in, and
+/// said nothing is no.
+#[test]
+fn whether_a_server_formats_is_read_off_its_reply() {
+    let reply = |capabilities: serde_json::Value| json!({ "capabilities": capabilities });
+    assert!(protocol::formats(&reply(json!({ "documentFormattingProvider": true }))).unwrap());
+    assert!(
+        protocol::formats(&reply(
+            json!({ "documentFormattingProvider": { "workDoneProgress": false } })
+        ))
+        .unwrap()
+    );
+    assert!(!protocol::formats(&reply(json!({}))).unwrap());
+}
+
+/// A formatting answer is edits to the one document, in bytes, that go straight into it.
+#[test]
+fn a_formatting_answer_is_edits_in_bytes_to_the_text_the_server_had() {
+    let text = "let é  = 1;\n";
+    let answer = json!([
+        { "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 7 } }, "newText": " " }
+    ]);
+    let edits = protocol::text_edits_from(answer, text, PositionEncoding::Utf16)
+        .expect("expected the edits to be read");
+    assert_eq!(
+        crate::edits::apply(text, &edits).expect("expected the edits to fit"),
+        "let é = 1;\n"
+    );
+    assert!(
+        protocol::text_edits_from(serde_json::Value::Null, text, PositionEncoding::Utf16)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A hover answer is one markdown text whichever of the protocol's shapes it came in, code in a
+/// named language as a fenced block, and nothing to say as nothing.
+#[test]
+fn a_hover_answer_is_one_markdown_text_whatever_shape_it_came_in() {
+    let markup = json!({ "contents": { "kind": "markdown", "value": "```rust\nfn greet()\n```\nSays hello." } });
+    assert_eq!(
+        protocol::hover_markdown_from(markup).unwrap().as_deref(),
+        Some("```rust\nfn greet()\n```\nSays hello.")
+    );
+    let marked =
+        json!({ "contents": [{ "language": "python", "value": "def greet()" }, "Says *hello*."] });
+    assert_eq!(
+        protocol::hover_markdown_from(marked).unwrap().as_deref(),
+        Some("```python\ndef greet()\n```\n\nSays *hello*.")
+    );
+    let plain = json!({ "contents": { "kind": "plaintext", "value": "a_b" } });
+    assert_eq!(
+        protocol::hover_markdown_from(plain).unwrap().as_deref(),
+        Some("```\na_b\n```")
+    );
+    assert_eq!(
+        protocol::hover_markdown_from(serde_json::Value::Null).unwrap(),
+        None
+    );
+    assert_eq!(
+        protocol::hover_markdown_from(json!({ "contents": "  " })).unwrap(),
+        None
+    );
+}
+
+/// What a server publishes about a file is read off the notification, and turned into the
+/// editor's bytes against the text it is about - a diagnostic about a line the text no longer
+/// has left out, and one with no severity read as an error.
+#[test]
+fn published_diagnostics_are_read_into_bytes_against_the_text_they_are_about() {
+    let notification = json!({ "jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
+        "uri": "file:///home/dev/repo/src/lib.rs",
+        "diagnostics": [
+            { "range": { "start": { "line": 0, "character": 8 }, "end": { "line": 0, "character": 9 } },
+              "severity": 2, "message": "unused variable: `x`", "source": "rustc" },
+            { "range": { "start": { "line": 0, "character": 13 }, "end": { "line": 0, "character": 14 } },
+              "message": "expected `;`" },
+            { "range": { "start": { "line": 9, "character": 0 }, "end": { "line": 9, "character": 1 } },
+              "severity": 1, "message": "about a line that is gone" },
+        ],
+    }});
+    let (path, published) =
+        protocol::published_diagnostics(&notification).expect("expected a readable notification");
+    assert_eq!(path, std::path::PathBuf::from("/home/dev/repo/src/lib.rs"));
+
+    let text = "let é = 1; x = 2\n";
+    let diagnostics = protocol::diagnostics_from(&published, text, PositionEncoding::Utf16);
+    assert_eq!(
+        diagnostics.len(),
+        2,
+        "the one past the end of the text is left out"
+    );
+    assert_eq!(
+        diagnostics[0].severity,
+        crate::payload::LspSeverity::Warning
+    );
+    assert_eq!(diagnostics[0].start, LspPosition { line: 0, column: 9 });
+    assert_eq!(diagnostics[0].source.as_deref(), Some("rustc"));
+    assert_eq!(diagnostics[1].severity, crate::payload::LspSeverity::Error);
+}
+
+/// A code action answer offers what can be carried out - literal actions with an edit that fits
+/// - the preferred first, and leaves out commands, disabled actions, and edits outside the repo.
+#[test]
+fn code_actions_offered_are_the_ones_that_can_be_carried_out_preferred_first() {
+    let root = std::path::Path::new("/home/dev/repo");
+    let text = |_: &str| -> anyhow::Result<String> { Ok("let x = 5;\n".to_string()) };
+    let edit_to = |file: &str| {
+        json!({ "changes": { format!("file:///home/dev/{file}"): [
+            { "range": { "start": { "line": 0, "character": 5 }, "end": { "line": 0, "character": 5 } }, "newText": ": i32" }
+        ]}})
+    };
+    let answer = json!([
+        { "title": "Run the tests", "command": "rust-analyzer.runSingle" },
+        { "title": "Insert explicit type `i32`", "kind": "refactor.rewrite", "edit": edit_to("repo/src/lib.rs") },
+        { "title": "Prefix with an underscore", "kind": "quickfix", "isPreferred": true, "edit": edit_to("repo/src/lib.rs") },
+        { "title": "Not now", "kind": "refactor", "disabled": { "reason": "no" }, "edit": edit_to("repo/src/lib.rs") },
+        { "title": "Edit a dependency", "kind": "quickfix", "edit": edit_to(".cargo/registry/dep.rs") },
+        { "title": "Only a command", "kind": "refactor", "command": { "title": "x", "command": "y" } },
+    ]);
+    let actions = protocol::code_actions_from(answer, root, PositionEncoding::Utf16, text)
+        .expect("expected the actions to be read");
+    assert_eq!(
+        actions
+            .iter()
+            .map(|action| action.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Prefix with an underscore", "Insert explicit type `i32`"]
+    );
+    assert_eq!(actions[1].kind.as_deref(), Some("refactor.rewrite"));
+    assert_eq!(actions[1].files[0].file_path, "src/lib.rs");
+}
+
+/// A signature shows the parameter being typed, named by its text or by where it is in
+/// UTF-16 units of the label - both as bytes of the label.
+#[test]
+fn a_signature_shows_the_parameter_being_typed_as_bytes_of_its_label() {
+    let by_text = json!({ "signatures": [{ "label": "fn add(a: u32, b: u32) -> u32",
+        "parameters": [{ "label": "a: u32" }, { "label": "b: u32" }] }], "activeParameter": 1 });
+    let signature = protocol::signature_from(by_text)
+        .unwrap()
+        .expect("a signature");
+    assert_eq!(
+        &signature.label[signature.active_parameter.clone().unwrap()],
+        "b: u32"
+    );
+
+    let by_place = json!({ "signatures": [{ "label": "fn café(é: u8, b: u8)",
+        "parameters": [{ "label": [8, 13] }, { "label": [15, 20] }], "activeParameter": 0,
+        "documentation": { "kind": "markdown", "value": "Brews." } }] });
+    let signature = protocol::signature_from(by_place)
+        .unwrap()
+        .expect("a signature");
+    assert_eq!(
+        &signature.label[signature.active_parameter.clone().unwrap()],
+        "é: u8"
+    );
+    assert_eq!(signature.documentation.as_deref(), Some("Brews."));
+
+    assert_eq!(
+        protocol::signature_from(json!({ "signatures": [] })).unwrap(),
+        None
+    );
+    assert_eq!(
+        protocol::signature_from(serde_json::Value::Null).unwrap(),
+        None
+    );
 }
