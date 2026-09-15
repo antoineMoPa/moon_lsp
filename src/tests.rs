@@ -450,6 +450,18 @@ fn typescript_and_its_react_flavour_are_two_languages_on_one_server() {
 }
 
 #[test]
+fn a_typst_file_is_served_by_tinymist_speaking_the_protocol() {
+    let language = languages::for_file("thesis.typ").expect("expected typst to be in the table");
+    assert_eq!(language.language_id, "typst");
+    assert_eq!(language.server.command, "tinymist");
+    assert_eq!(
+        language.server.args,
+        &["lsp"],
+        "tinymist is a toolbox, and only its lsp subcommand speaks the protocol"
+    );
+}
+
+#[test]
 fn an_extension_nothing_serves_has_no_language_behind_it() {
     assert!(languages::for_file("README.md").is_none());
     assert!(languages::for_file("Makefile").is_none());

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Typst. A `.typ` is served by tinymist, started as `tinymist lsp`.
+
 - Code actions and signature help. `LspRegistry::code_actions` asks what the server offers at a
   place, with the diagnostics published there, and hands back only what can be carried out -
   literal actions whose edits fit, in the editor's bytes; commands and disabled actions are left

@@ -94,6 +94,79 @@ fn a_real_language_server_says_where_a_symbol_is_defined() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// tinymist, on a Typst document: where a function the page calls is defined.
+///
+/// A third server on the wire, and one that was not written against: rust-analyzer and
+/// typescript-language-server are what the readiness rule and the progress handling were
+/// shaped on, so a server neither of them resembles is what shows whether the rule is a
+/// rule or a description of those two.
+///
+/// `#[ignore]`d like the rest of this file. Run it with
+/// `cargo test --test real_servers -- --ignored --nocapture a_real_typst_server`.
+#[test]
+#[ignore]
+fn a_real_typst_server_says_where_a_function_is_defined() {
+    let root = fixture_root("typst");
+    let source = "#let greet(name) = [Hello, #name!]\n\n= A page\n\n#greet(\"world\")\n";
+    std::fs::write(root.join("main.typ"), source).expect("failed to write the fixture file");
+
+    let servers = registry();
+    let repo = Workspace {
+        key: WORKSPACE,
+        root: &root,
+    };
+    servers
+        .did_open(&repo, "main.typ", source)
+        .expect("failed to open the document");
+    let started_at = Instant::now();
+    wait_until_ready(&servers, "main.typ", Duration::from_secs(60));
+    println!("ready after {:?}", started_at.elapsed());
+
+    // The `greet` of `#greet("world")`, on the fifth line, just past the hash.
+    let at = LspPosition { line: 4, column: 2 };
+    let locations = servers
+        .definition(&repo, "main.typ", at)
+        .expect("failed to ask where greet is defined");
+    println!(
+        "definition: {:?}",
+        locations
+            .iter()
+            .map(|location| (&location.file_path, location.line_number))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(locations.len(), 1, "expected one definition");
+    assert_eq!(locations[0].file_path, "main.typ");
+    assert_eq!(
+        locations[0].line_number, 1,
+        "greet is defined on the first line"
+    );
+
+    let hover = servers
+        .hover(&repo, "main.typ", at)
+        .expect("failed to ask what greet is");
+    println!("hover: {hover:?}");
+    assert!(
+        hover.is_some_and(|text| text.contains("greet")),
+        "expected the server to say something about greet"
+    );
+
+    let completions = servers
+        .completion(&repo, "main.typ", LspPosition { line: 4, column: 3 })
+        .expect("failed to ask what could be typed");
+    println!("completions: {}", completions.len());
+    assert!(
+        completions
+            .iter()
+            .any(|completion| completion.label == "greet"),
+        "expected greet among what can be typed here"
+    );
+
+    servers
+        .did_close(&repo, "main.typ")
+        .expect("failed to close the document");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The reported bug: go-to-definition on a real Rust project answered "rust is still
 /// indexing this project - try again in a moment" and went on saying it for the whole
 /// session.

@@ -32,8 +32,8 @@ for place in servers.definition(&repo, "src/main.rs", LspPosition { line: 4, col
 }
 ```
 
-Rust, TypeScript, JavaScript and Python are in the table today. Adding a language is a row in
-`languages::EXTENSIONS`, and a `ServerSpec` beside the others if its server is a new one.
+Rust, TypeScript, JavaScript, Python and Typst are in the table today. Adding a language is a row
+in `languages::EXTENSIONS`, and a `ServerSpec` beside the others if its server is a new one.
 
 ## The seam
 

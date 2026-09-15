@@ -58,6 +58,14 @@ pub const PYRIGHT: ServerSpec = ServerSpec {
     args: &["--stdio"],
 };
 
+/// tinymist, which serves Typst's `.typ`. The binary is a toolbox - it previews, compiles
+/// and queries too - and `lsp` is the subcommand that speaks the protocol on stdio.
+pub const TINYMIST: ServerSpec = ServerSpec {
+    name: "typst",
+    command: "tinymist",
+    args: &["lsp"],
+};
+
 /// Every extension a server is offered for. An extension that is not here has no server
 /// behind it, which is most of a repo - markdown, configuration, images.
 pub const EXTENSIONS: &[ExtensionSpec] = &[
@@ -95,6 +103,11 @@ pub const EXTENSIONS: &[ExtensionSpec] = &[
         extension: "py",
         language_id: "python",
         server: &PYRIGHT,
+    },
+    ExtensionSpec {
+        extension: "typ",
+        language_id: "typst",
+        server: &TINYMIST,
     },
 ];
 
