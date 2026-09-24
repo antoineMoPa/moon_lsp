@@ -618,12 +618,22 @@ fn read_messages(
         let mut stdout = stdout;
         let mut frames = Frames::default();
         let mut buffer = vec![0u8; READ_CHUNK];
-        loop {
+        let ended = 'reading: loop {
             match stdout.read(&mut buffer) {
-                Ok(0) | Err(_) => break,
+                Ok(0) | Err(_) => break 'reading "the language server exited".to_string(),
                 Ok(count) => frames.push(&buffer[..count]),
             }
-            while let Some(message) = frames.next_message() {
+            loop {
+                let message = match frames.next_message() {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    // Past a broken frame nothing more can be read, so the server is treated
+                    // as gone; dropping its stdout closes the pipe, which ends a server still
+                    // writing to it.
+                    Err(broken) => {
+                        break 'reading format!("the language server's output broke off: {broken}");
+                    }
+                };
                 let Ok(message) = serde_json::from_str::<Value>(&message) else {
                     continue;
                 };
@@ -636,13 +646,14 @@ fn read_messages(
                     &stdin,
                 );
             }
-        }
+        };
+        drop(stdout);
 
         // The server is gone. Everyone waiting on it is told now rather than sitting out
         // their whole timeout.
         for (_, waiting) in pending.lock().unwrap().drain() {
             let _ = waiting.send(Err(Refusal {
-                said: "the language server exited".to_string(),
+                said: ended.clone(),
                 code: None,
             }));
         }

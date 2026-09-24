@@ -9,7 +9,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::{
-    framing::{self, Frames},
+    framing::{self, Frames, FramingError},
     languages,
     payload::{LspCompletionKind, LspPosition, LspStatus},
     process::{
@@ -211,16 +211,16 @@ fn a_message_split_across_reads_is_read_out_once_all_of_it_has_arrived() {
     let mut frames = Frames::default();
     frames.push(front);
     assert!(
-        frames.next_message().is_none(),
+        frames.next_message().expect("expected a well-formed stream").is_none(),
         "half a message is not a message"
     );
     frames.push(back);
     assert_eq!(
-        frames.next_message().expect("expected the whole message"),
+        frames.next_message().expect("expected a well-formed stream").expect("expected the whole message"),
         r#"{"id":7,"result":null}"#
     );
     assert!(
-        frames.next_message().is_none(),
+        frames.next_message().expect("expected a well-formed stream").is_none(),
         "there was only one message"
     );
 }
@@ -232,16 +232,55 @@ fn two_messages_arriving_together_are_read_out_in_order() {
 
     let mut frames = Frames::default();
     frames.push(&arrived);
-    assert_eq!(frames.next_message().as_deref(), Some(r#"{"id":1}"#));
-    assert_eq!(frames.next_message().as_deref(), Some(r#"{"id":2}"#));
-    assert_eq!(frames.next_message(), None);
+    assert_eq!(frames.next_message().expect("expected a well-formed stream").as_deref(), Some(r#"{"id":1}"#));
+    assert_eq!(frames.next_message().expect("expected a well-formed stream").as_deref(), Some(r#"{"id":2}"#));
+    assert_eq!(frames.next_message(), Ok(None));
+}
+
+#[test]
+fn a_declared_length_past_the_limit_is_refused_before_any_body_arrives() {
+    let mut frames = Frames::default();
+    frames.push(b"Content-Length: 18446744073709551615\r\n\r\n");
+    assert_eq!(
+        frames.next_message(),
+        Err(FramingError::BodyTooLarge {
+            declared: usize::MAX
+        })
+    );
+
+    let mut frames = Frames::default();
+    let past = framing::MAX_BODY_BYTES + 1;
+    frames.push(format!("Content-Length: {past}\r\n\r\n").as_bytes());
+    assert_eq!(
+        frames.next_message(),
+        Err(FramingError::BodyTooLarge { declared: past })
+    );
+}
+
+#[test]
+fn a_header_that_never_ends_is_refused_once_it_is_past_the_limit() {
+    let mut frames = Frames::default();
+    frames.push(&vec![b'x'; framing::MAX_HEADER_BYTES]);
+    assert_eq!(frames.next_message(), Ok(None));
+    frames.push(b"x");
+    assert_eq!(frames.next_message(), Err(FramingError::HeaderTooLong));
+}
+
+#[test]
+fn a_header_without_a_length_ends_the_stream() {
+    let mut frames = Frames::default();
+    frames.push(b"Content-Length: many\r\n\r\n{}");
+    assert!(matches!(
+        frames.next_message(),
+        Err(FramingError::NoContentLength { .. })
+    ));
 }
 
 #[test]
 fn a_header_with_a_content_type_beside_the_length_is_still_read() {
     let mut frames = Frames::default();
     frames.push(b"Content-Type: application/vscode-jsonrpc\r\nContent-Length: 8\r\n\r\n{\"id\":1}");
-    assert_eq!(frames.next_message().as_deref(), Some(r#"{"id":1}"#));
+    assert_eq!(frames.next_message().expect("expected a well-formed stream").as_deref(), Some(r#"{"id":1}"#));
 }
 
 /// The one that matters. `héllo` is five characters, six bytes and five UTF-16 units, so a
