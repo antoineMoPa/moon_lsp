@@ -350,12 +350,26 @@ impl LanguageServer {
         search_path: &str,
         client: &crate::protocol::ClientIdentity,
     ) -> Result<Self> {
-        let command_path = crate::languages::installed_at(spec.command, search_path)
-            .ok_or_else(|| anyhow!("{} is not installed", spec.command))?;
-        let mut child = Command::new(command_path)
+        let mut command = Command::new(installed(spec, search_path)?);
+        command.env("PATH", search_path);
+        Self::start_with(spec, repo_root, client, command)
+    }
+
+    /// The same, with the command that runs the server's binary made by the caller: for a
+    /// server that is not a plain child of this process - one run as another user, say. See
+    /// [`LspRegistry::starting_servers_with`](crate::registry::LspRegistry::starting_servers_with).
+    ///
+    /// The server's arguments, the repo it is started in and its pipes are added to `command`
+    /// here. Its environment is left as the caller made it, `PATH` included.
+    pub fn start_with(
+        spec: &'static ServerSpec,
+        repo_root: &std::path::Path,
+        client: &crate::protocol::ClientIdentity,
+        mut command: Command,
+    ) -> Result<Self> {
+        let mut child = command
             .args(spec.args)
             .current_dir(repo_root)
-            .env("PATH", search_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -588,6 +602,13 @@ impl Drop for LanguageServer {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// Where a server's binary is on `search_path` - see [`crate::languages::installed_at`] - and
+/// an error for one that is not installed, which is no server to start.
+pub(crate) fn installed(spec: &ServerSpec, search_path: &str) -> Result<std::path::PathBuf> {
+    crate::languages::installed_at(spec.command, search_path)
+        .ok_or_else(|| anyhow!("{} is not installed", spec.command))
 }
 
 fn write_message(stdin: &Mutex<ChildStdin>, message: &Value) -> Result<()> {

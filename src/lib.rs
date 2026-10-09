@@ -44,6 +44,10 @@
 //! of [`LspRegistry::did_change`] is the caller's, since a round trip per keystroke is a flood
 //! wherever this is reached over a network.
 //!
+//! How a server's process is made is the caller's as well, when it has something to say about
+//! it: a host that runs its servers as another user says how with
+//! [`LspRegistry::starting_servers_with`], and every other host says nothing.
+//!
 //! # The parts
 //!
 //! [`languages`] says which server serves which file, [`process`] runs one and carries the

@@ -8,6 +8,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -16,7 +17,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::{
     languages::{self, ExtensionSpec, ServerSpec},
     payload::{LspCompletion, LspFileEdit, LspLocation, LspPosition, LspStatus, LspWork},
-    process::{LanguageServer, PositionEncoding},
+    process::{self, LanguageServer, PositionEncoding},
     protocol::{self, AskedBecause, ClientIdentity},
 };
 
@@ -37,6 +38,10 @@ pub struct Workspace<'a> {
 /// One server, per workspace key and per server in the language table.
 type ServerKey = (String, &'static str);
 
+/// Makes the command that runs a server's binary, out of where the binary is - see
+/// [`LspRegistry::starting_servers_with`].
+type CommandFor = Box<dyn Fn(&Path) -> Result<Command> + Send + Sync>;
+
 /// The language servers running for one host application.
 ///
 /// Built once and held for the life of the process - dropping it shuts every server down.
@@ -50,6 +55,10 @@ pub struct LspRegistry {
     /// unless one is said with [`LspRegistry::identifying_as`] this is the crate itself -
     /// see [`ClientIdentity`].
     client: ClientIdentity,
+    /// How a server's process is made, when the caller has said - see
+    /// [`LspRegistry::starting_servers_with`]. `None` is a plain child of this process,
+    /// started on the search path.
+    command_for: Option<CommandFor>,
     servers: Mutex<HashMap<ServerKey, Arc<LanguageServer>>>,
     /// The servers that are on PATH and would not start, which is not the same as not being
     /// installed at all: a `rust-analyzer` on PATH that is really a rustup shim for a
@@ -68,6 +77,7 @@ impl LspRegistry {
         Self {
             search_path,
             client: ClientIdentity::default(),
+            command_for: None,
             servers: Mutex::new(HashMap::new()),
             would_not_start: Mutex::new(HashSet::new()),
         }
@@ -90,6 +100,39 @@ impl LspRegistry {
     /// ```
     pub fn identifying_as(mut self, client: ClientIdentity) -> Self {
         self.client = client;
+        self
+    }
+
+    /// Say how a server's process is made, for a host application whose servers are not plain
+    /// children of its own: run as another user, or under a wrapper.
+    ///
+    /// `command_for` is handed where a server's binary was found on the search path, and
+    /// answers with the command that runs it. The server's arguments, the repo it is started
+    /// in and its pipes are added to that command here; its environment is the caller's to
+    /// decide, `PATH` included, where a registry left to itself starts a server on its search
+    /// path.
+    ///
+    /// It is the one way every server of this registry is started. Servers that are to be
+    /// started two ways - as two users of one machine - are two registries, each with the
+    /// search path of its own user, which is also what keeps a server of one from ever being
+    /// answered out of by the other.
+    ///
+    /// ```
+    /// use moon_lsp::LspRegistry;
+    /// use std::process::Command;
+    ///
+    /// let servers = LspRegistry::new("/home/dev/.cargo/bin:/usr/bin".to_string())
+    ///     .starting_servers_with(|server| {
+    ///         let mut command = Command::new("sudo");
+    ///         command.args(["--user", "dev", "--"]).arg(server);
+    ///         Ok(command)
+    ///     });
+    /// ```
+    pub fn starting_servers_with(
+        mut self,
+        command_for: impl Fn(&Path) -> Result<Command> + Send + Sync + 'static,
+    ) -> Self {
+        self.command_for = Some(Box::new(command_for));
         self
     }
 
@@ -179,12 +222,13 @@ impl LspRegistry {
             return Ok(running);
         }
 
-        let started = Arc::new(LanguageServer::start(
-            spec,
-            repo_root,
-            &self.search_path,
-            &self.client,
-        )?);
+        let started = Arc::new(match &self.command_for {
+            None => LanguageServer::start(spec, repo_root, &self.search_path, &self.client)?,
+            Some(command_for) => {
+                let command = command_for(&process::installed(spec, &self.search_path)?)?;
+                LanguageServer::start_with(spec, repo_root, &self.client, command)?
+            }
+        });
         let mut servers = self.servers.lock().unwrap();
         Ok(Arc::clone(servers.entry(key.clone()).or_insert(started)))
     }
@@ -694,5 +738,43 @@ pub(crate) fn status_without_a_server(
     match (language, has_a_server_to_start) {
         (Some(_), true) => LspStatus::Starting,
         _ => LspStatus::Unavailable,
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf};
+
+    use super::*;
+
+    /// What a host that runs its servers as somebody else relies on: the command of every
+    /// server is the one it made, out of where the binary is on the search path it gave.
+    #[test]
+    fn a_registry_told_how_to_start_its_servers_starts_them_with_the_command_it_is_given() {
+        let bin = std::env::temp_dir().join(format!("moon-lsp-started-{}", std::process::id()));
+        fs::create_dir_all(&bin).expect("a scratch folder");
+        let installed = bin.join(languages::RUST_ANALYZER.command);
+        fs::write(&installed, "#!/bin/sh\n").expect("a file named as the server is");
+        fs::set_permissions(&installed, fs::Permissions::from_mode(0o755))
+            .expect("the file made runnable");
+
+        let asked_for: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+        let asked = Arc::clone(&asked_for);
+        let registry =
+            LspRegistry::new(bin.display().to_string()).starting_servers_with(move |server| {
+                asked.lock().unwrap().push(server.to_path_buf());
+                // Ends at once without a word of the protocol, as the command that was run.
+                Ok(Command::new("true"))
+            });
+        let repo = Workspace {
+            key: "one window",
+            root: &bin,
+        };
+
+        let opened = registry.did_open(&repo, "main.rs", "fn main() {}\n");
+
+        assert_eq!(*asked_for.lock().unwrap(), [installed]);
+        assert!(opened.is_err(), "`true` is no language server");
+        let _ = fs::remove_dir_all(&bin);
     }
 }
